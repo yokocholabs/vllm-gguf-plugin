@@ -57,6 +57,46 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             model_type = "command-r"
         if model_type == "gemma3_text":
             model_type = "gemma3"
+        if model_type == "glm_moe_dsa":
+            model_type = "glm-dsa"
+            first_moe_layer = getattr(config, "first_k_dense_replace", 0)
+            for idx in range(first_moe_layer, config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_inp.weight"] = (
+                    f"model.layers.{idx}.mlp.gate.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.exp_probs_b.bias"] = (
+                    f"model.layers.{idx}.mlp.gate.e_score_correction_bias"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_shexp.weight"] = (
+                    f"model.layers.{idx}.mlp.shared_experts.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_shexp.weight"] = (
+                    f"model.layers.{idx}.mlp.shared_experts.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_shexp.weight"] = (
+                    f"model.layers.{idx}.mlp.shared_experts.up_proj.weight"
+                )
+                sideload_params.extend(
+                    [
+                        regex.compile(
+                            f"model\\.layers\\.{idx}"
+                            r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                        ),
+                        regex.compile(
+                            f"model\\.layers\\.{idx}"
+                            r"\.mlp\.experts\.(gate_up_proj|down_proj)"
+                        ),
+                    ]
+                )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             for idx in range(config.num_hidden_layers):
