@@ -157,20 +157,22 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
 
-                # Intercept indexer weights to bypass stacked_params_mapping
-                # substring collision in DeepseekV2Model.load_weights.
-                all_weights = list(adapter.prepare_weights(model_config))
-                indexer_weights, other_weights = self._split_indexer_weights(
-                    all_weights
+            # Prepare weights outside target_device context so torch.tensor()
+            # defaults to CPU — the dequantize path in weight_utils does
+            # .cuda() then .cpu(), while F32 tensors stay on the default
+            # device.  Mixing devices breaks torch.cat in prepare_weights.
+            all_weights = list(adapter.prepare_weights(model_config))
+            indexer_weights, other_weights = self._split_indexer_weights(
+                all_weights
+            )
+            if indexer_weights:
+                logger.info(
+                    "Loading %d indexer weight tensors directly "
+                    "(bypassing stacked_params_mapping)",
+                    len(indexer_weights),
                 )
-                if indexer_weights:
-                    logger.info(
-                        "Loading %d indexer weight tensors directly "
-                        "(bypassing stacked_params_mapping)",
-                        len(indexer_weights),
-                    )
-                    self._load_indexer_weights(model, indexer_weights)
+                self._load_indexer_weights(model, indexer_weights)
 
-                model.load_weights(other_weights)
+            model.load_weights(other_weights)
             process_weights_after_loading(model, model_config, target_device)
         return model
