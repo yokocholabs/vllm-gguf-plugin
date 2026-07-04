@@ -22,11 +22,26 @@ def _resolve_gguf_weight_loader(
     layer: torch.nn.Module,
     fallback_weight_loader=None,
 ):
-    return (
-        layer.weight_loader_v2
-        if hasattr(layer, "weight_loader_v2")
-        else fallback_weight_loader
-    )
+    if hasattr(layer, "weight_loader_v2"):
+        return layer.weight_loader_v2
+    if fallback_weight_loader is None:
+        return None
+
+    def _gguf_weight_fallback_loader(param, loaded_weight, loaded_shard_id=None):
+        # Layers without weight_loader_v2 (e.g. ReplicatedLinear — GLM-5.2
+        # indexer wq_b) fall back to a plain copy loader that asserts
+        # param.size() == loaded_weight.size() and can't materialize the
+        # uninitialized [0]-shaped GGUF params.  Store directly instead,
+        # mirroring _gguf_weight_type_loader_v2.
+        if hasattr(param, "_store"):
+            param._store(loaded_weight, shard_id=loaded_shard_id)
+            return
+        if loaded_shard_id is None:
+            fallback_weight_loader(param, loaded_weight)
+        else:
+            fallback_weight_loader(param, loaded_weight, loaded_shard_id)
+
+    return _gguf_weight_fallback_loader
 
 
 def _resolve_gguf_weight_type_loader(

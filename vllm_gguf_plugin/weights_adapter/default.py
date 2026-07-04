@@ -433,37 +433,38 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 )
             if "kv_b_proj.weight" in name:
                 if kv_b_held is not None:
-                    # Second shard (V) arrived — coalesce with held K.
+                    # Second shard arrived — fuse with the held one.
+                    # GGUF stores per-head 3D tensors:
+                    #   attn_k_b = W_UK^T: [n_head, kv_lora, qk_nope]
+                    #   attn_v_b = W_UV:   [n_head, v_head, kv_lora]
+                    # vLLM MLA requires HF kv_b_proj layout — rows
+                    # interleaved PER HEAD as [K_h(qk_nope); V_h(v_head)]:
+                    # process_weights_after_loading does
+                    # .T.view(kv_lora, n_head, qk_nope+v).split(...).
+                    # A block cat ([all K; all V]) has the right shape but
+                    # scrambles heads (and TP sharding).
                     a = kv_b_held[1]
                     b = tensor
-                    # K: [n_head, kv_lora, qk_nope] -> transpose(1,2) ->
-                    #    [n_head, qk_nope, kv_lora] -> [n_head*qk_nope, kv_lora]
-                    # V: [n_head, v_head, kv_lora] -> [n_head*v_head, kv_lora]
                     if a.dim() == 3 and b.dim() == 3:
                         if a.shape[1] == b.shape[2]:
-                            # a=K, b=V
-                            a2 = a.transpose(1, 2).reshape(
-                                a.shape[0] * a.shape[2], a.shape[1])
-                            b2 = b.reshape(
-                                b.shape[0] * b.shape[1], b.shape[2])
-                        elif a.shape[2] == b.shape[1]:
-                            # a=V, b=K
-                            a2 = a.reshape(
-                                a.shape[0] * a.shape[1], a.shape[2])
-                            b2 = b.transpose(1, 2).reshape(
-                                b.shape[0] * b.shape[2], b.shape[1])
+                            k3, v3 = a, b
                         else:
-                            a2 = a.reshape(
-                                a.shape[0] * a.shape[1], a.shape[2])
-                            b2 = b.reshape(
-                                b.shape[0] * b.shape[1], b.shape[2])
+                            k3, v3 = b, a
+                        # [n_head, qk_nope, kv_lora]
+                        k3 = k3.transpose(1, 2)
+                        # [n_head, qk_nope + v_head, kv_lora]
+                        fused = torch.cat([k3, v3], dim=1)
+                        logger.debug(
+                            "Coalescing %s per-head: K=%s V=%s -> %s",
+                            name, k3.shape, v3.shape, fused.shape,
+                        )
+                        yield name, fused.reshape(-1, fused.shape[-1])
                     else:
-                        a2, b2 = a, b
-                    logger.debug(
-                        "Coalescing %s: cat([%s, %s], dim=0)",
-                        name, a2.shape, b2.shape,
-                    )
-                    yield name, torch.cat([a2, b2], dim=0)
+                        logger.debug(
+                            "Coalescing %s: cat([%s, %s], dim=0)",
+                            name, a.shape, b.shape,
+                        )
+                        yield name, torch.cat([a, b], dim=0)
                     kv_b_held = None
                 else:
                     # First shard (K) — hold until V arrives.
