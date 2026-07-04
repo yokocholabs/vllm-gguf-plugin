@@ -184,7 +184,7 @@ class GGUFModelLoader(BaseModelLoader):
                 weights: Iterable[tuple[str, torch.Tensor]],
             ) -> Iterable[tuple[str, torch.Tensor]]:
                 for name, tensor in weights:
-                    if ".indexer." in name:
+                    if ".indexer.wk_weights_proj" in name:
                         indexer_weights.append((name, tensor))
                     else:
                         yield name, tensor
