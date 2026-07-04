@@ -103,31 +103,37 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
 
             # GLM-5.2 DSA Indexer: vLLM fuses wk + weights_proj into
             # MergedColumnParallelLinear (wk_weights_proj) with
-            # quant_config=None and disable_tp=True.  The GGUF stores them
+            # quant_config=None, disable_tp=True.  The GGUF stores them
             # as separate tensors: blk.{idx}.indexer.attn_k (Q8_0, the "wk"
             # shard) and blk.{idx}.indexer.proj (F32, the "weights_proj"
-            # shard).  Map both to the FUSED HF name and coalesce in
-            # prepare_weights via torch.cat.  Use the default 2-arg
-            # weight_loader path — do NOT use unfused shard names +
-            # stacked_params_mapping (disable_tp=True creates [0] params
-            # on TP>1).  Mark as force_unquantized so the iterator
-            # dequantizes Q8_0 attn_k to fp32.
+            # shard).  Map to the UNFUSED HF shard names so vLLM's
+            # stacked_params_mapping handles the fusion natively:
+            #   ("wk_weights_proj", "wk", 0)
+            #   ("wk_weights_proj", "weights_proj", 1)
+            # Dequantize attn_k Q8_0 → bf16 via force_unquantized_modules.
+            # weights_proj is already F32, no dequant needed.
             for idx in range(config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.indexer.attn_k.weight"] = (
-                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
+                    f"model.layers.{idx}.self_attn.indexer.wk.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.indexer.proj.weight"] = (
-                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
+                    f"model.layers.{idx}.self_attn.indexer.weights_proj.weight"
                 )
+            # Dequant Q8_0 wk → bf16 (iterator path)
+            force_unquantized_modules.append("indexer.wk")
+            # Force UnquantizedLinearMethod for the fused layer
             force_unquantized_modules.append("indexer.wk_weights_proj")
 
-            # GLM-5.2 DSA MLA: vLLM fuses K and V projections into a single
-            # kv_b_proj (ColumnParallelLinear with quant_config).  The GGUF
-            # stores them separately as blk.{idx}.attn_k_b (Q8_0) and
-            # blk.{idx}.attn_v_b (Q8_0).  Map both to the FUSED HF name
-            # (kv_b_proj) and coalesce in prepare_weights.  Mark as
-            # force_unquantized so the iterator dequantizes both Q8_0
-            # shards to fp32 before concatenation.
+            # GLM-5.2 DSA MLA kv_b_proj: vLLM has a single 2D
+            # ColumnParallelLinear kv_b_proj [num_heads*(qk_nope+v_head),
+            # kv_lora_rank] with quant_config.  The GGUF stores K and V as
+            # SEPARATE 3D per-head tensors:
+            #   attn_k_b: [n_head, kv_lora_rank, qk_nope_head_dim] Q8_0
+            #   attn_v_b: [n_head, v_head_dim, kv_lora_rank]      Q8_0
+            # These have different shapes (K: in=192, V: in=512) so cannot
+            # be loaded as quantized shards.  Dequantize to bf16, reshape
+            # to 2D, and concatenate along dim=0 in prepare_weights.
+            # Memory: bf16 not fp32, streaming (1 layer at a time).
             for idx in range(config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.attn_k_b.weight"] = (
                     f"model.layers.{idx}.self_attn.kv_b_proj.weight"
@@ -135,6 +141,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 gguf_to_hf_name_map[f"blk.{idx}.attn_v_b.weight"] = (
                     f"model.layers.{idx}.self_attn.kv_b_proj.weight"
                 )
+            # Dequant Q8_0 → bf16 (iterator path)
             force_unquantized_modules.append("self_attn.kv_b_proj")
 
         if model_type in ("deepseek_v3", "deepseek_v2"):
@@ -418,24 +425,56 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             self.load_spec.unquantized_modules,
         )
         mapped = self.map_weights(weights)
-        # Coalesce tensors that share the same HF name (GLM-5.2 indexer
-        # attn_k + proj both map to wk_weights_proj.weight).  Concatenate
-        # along dim=0.  Memory bounded to 2 tensors at a time.
+        # Coalesce tensors that share the same HF name.
+        # Two cases:
+        #   1. kv_b_proj: attn_k_b (3D [n_head, kv_lora, qk_nope]) and
+        #      attn_v_b (3D [n_head, v_head, kv_lora]) both map to
+        #      kv_b_proj.weight.  Reshape each to 2D and concat dim=0.
+        #   2. Any other same-name duplicates: concat dim=0.
+        # Memory bounded: hold max 1 tensor at a time (streaming).
         held_name: str | None = None
         held_tensor: torch.Tensor | None = None
         for name, tensor in mapped:
-            if "indexer" in name:
+            if "indexer" in name or "kv_b_proj" in name:
                 logger.debug(
-                    "GGUF indexer weight: %s shape=%s dtype=%s",
+                    "GGUF weight: %s shape=%s dtype=%s",
                     name, tensor.shape, tensor.dtype,
                 )
             if name == held_name:
                 assert held_tensor is not None
+                a = held_tensor
+                b = tensor
+                # GLM-5.2 kv_b_proj: K and V are 3D per-head tensors.
+                # K: [n_head, kv_lora, qk_nope] -> transpose(1,2) ->
+                #    [n_head, qk_nope, kv_lora] -> [n_head*qk_nope, kv_lora]
+                # V: [n_head, v_head, kv_lora] ->
+                #    [n_head*v_head, kv_lora]
+                # Then cat dim=0 -> [n_head*(qk_nope+v_head), kv_lora]
+                if a.dim() == 3 and b.dim() == 3:
+                    # Detect K (in=kv_lora, out=qk_nope): middle dim
+                    # differs from V's last dim
+                    if a.shape[1] == b.shape[2]:
+                        # a=K [n_head, kv_lora, qk_nope],
+                        # b=V [n_head, v_head, kv_lora]
+                        a2 = a.transpose(1, 2).reshape(
+                            a.shape[0] * a.shape[2], a.shape[1])
+                        b2 = b.reshape(b.shape[0] * b.shape[1], b.shape[2])
+                    elif a.shape[2] == b.shape[1]:
+                        # a=V, b=K (V came first)
+                        a2 = a.reshape(a.shape[0] * a.shape[1], a.shape[2])
+                        b2 = b.transpose(1, 2).reshape(
+                            b.shape[0] * b.shape[2], b.shape[1])
+                    else:
+                        a2 = a.reshape(a.shape[0] * a.shape[1], a.shape[2])
+                        b2 = b.reshape(b.shape[0] * b.shape[1], b.shape[2])
+                else:
+                    a2 = a
+                    b2 = b
                 logger.debug(
-                    "Coalescing indexer shards: %s cat([%s, %s], dim=0)",
-                    name, held_tensor.shape, tensor.shape,
+                    "Coalescing %s: cat([%s, %s], dim=0)",
+                    name, a2.shape, b2.shape,
                 )
-                yield name, torch.cat([held_tensor, tensor], dim=0)
+                yield name, torch.cat([a2, b2], dim=0)
                 held_name = None
                 held_tensor = None
             else:
