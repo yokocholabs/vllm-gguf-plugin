@@ -92,20 +92,31 @@ def get_gguf_weight_type_map(
 
 
 def gguf_quant_weights_iterator(
-    gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str] | None
+    gguf_file: str | Path,
+    gguf_to_hf_name_map: dict[str, str] | None,
+    unquantized_modules: list[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    yield from gguf_quant_weights_iterator_multi([gguf_file], gguf_to_hf_name_map)
+    yield from gguf_quant_weights_iterator_multi(
+        [gguf_file], gguf_to_hf_name_map, unquantized_modules
+    )
 
 
 def gguf_quant_weights_iterator_multi(
-    gguf_files: list[str], gguf_to_hf_name_map: dict[str, str] | None = None
+    gguf_files: list[str],
+    gguf_to_hf_name_map: dict[str, str] | None = None,
+    unquantized_modules: list[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield ``(name, tensor)`` for all tensors in *gguf_files*.
 
     When *gguf_to_hf_name_map* is ``None``, raw GGUF tensor names are used
-    directly (useful when a caller will apply a :class:`WeightsMapper`
+    directly (useful when a caller will apply a :class:`WeightsMapper``
     afterwards).  When a mapping is provided, tensors not present in the map
     are skipped and names are translated accordingly.
+
+    When *unquantized_modules* is provided, quantized tensors whose mapped
+    name contains one of the listed module prefixes are dequantized on the
+    fly via ``ggml_dequantize`` and yielded as ``.weight`` instead of
+    ``.qweight`` / ``.qweight_type``.
     """
     _QUANT_TYPES = ("F32", "BF16", "F16")
 
@@ -120,6 +131,32 @@ def gguf_quant_weights_iterator_multi(
                 name = tensor.name
 
             weight_type = tensor.tensor_type
+
+            # Dequantize tensors belonging to modules marked as unquantized
+            # but stored quantized in the GGUF (e.g. GLM-5.2 indexer
+            # wk/weights_proj with IQ1_S).  Yield as .weight, not .qweight.
+            if (
+                weight_type.name not in _QUANT_TYPES
+                and unquantized_modules
+                and any(
+                    mod in name.removesuffix(".weight")
+                    for mod in unquantized_modules
+                )
+            ):
+                from gguf import GGML_QUANT_SIZES
+
+                from vllm_gguf_plugin.ops import ggml_dequantize
+
+                block_size, type_size = GGML_QUANT_SIZES[weight_type]
+                raw = torch.tensor(tensor.data)
+                rows = raw.shape[0] if raw.dim() > 1 else 1
+                cols = raw.shape[-1] // type_size * block_size
+                param = ggml_dequantize(
+                    raw.cuda(), weight_type, rows, cols, torch.float32
+                ).cpu()
+                yield name, param
+                continue
+
             if weight_type.name not in _QUANT_TYPES:
                 yield name.replace("weight", "qweight_type"), torch.tensor(weight_type)
                 name = name.replace("weight", "qweight")

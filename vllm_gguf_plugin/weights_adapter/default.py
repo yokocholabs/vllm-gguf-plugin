@@ -42,7 +42,9 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
     def patch_hf_config(self, model_path: str, hf_config: PretrainedConfig):
         return maybe_patch_hf_config_from_gguf(model_path, hf_config)
 
-    def build_name_map(self, model_config: ModelConfig) -> dict[str, str]:
+    def build_name_map(
+        self, model_config: ModelConfig
+    ) -> tuple[dict[str, str], list[str]]:
         config = model_config.hf_config
         text_config = config.get_text_config()
         model_type = config.model_type
@@ -52,6 +54,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
 
         gguf_to_hf_name_map: dict[str, str] = {}
         sideload_params: list[re.Pattern] = []
+        force_unquantized_modules: list[str] = []
 
         if model_type == "cohere":
             model_type = "command-r"
@@ -97,6 +100,23 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                         ),
                     ]
                 )
+
+            # GLM-5.2 DSA Indexer: vLLM fuses wk + weights_proj into
+            # MergedColumnParallelLinear (wk_weights_proj) with
+            # quant_config=None.  The GGUF stores them as separate quantized
+            # tensors (blk.{idx}.indexer.attn_k and blk.{idx}.indexer.proj).
+            # Map both to the fused HF name and mark as force_unquantized so
+            # the iterator dequantizes IQ1_S to fp32.  prepare_weights
+            # coalesces the two shards by holding back one tensor at a time.
+            for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.indexer.attn_k.weight"] = (
+                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.indexer.proj.weight"] = (
+                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
+                )
+            force_unquantized_modules.append("indexer.wk_weights_proj")
+
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             for idx in range(config.num_hidden_layers):
@@ -268,7 +288,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 f"Failed to map GGUF parameters "
                 f"({len(unmapped_params)}): {unmapped_params}"
             )
-        return gguf_to_hf_name_map
+        return gguf_to_hf_name_map, force_unquantized_modules
 
     def map_weights(
         self,
@@ -339,15 +359,17 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         model_config.hf_config = self.patch_hf_config(
             model_path, model_config.hf_config
         )
-        gguf_to_hf_name_map = self.build_name_map(model_config)
+        gguf_to_hf_name_map, force_unquantized = self.build_name_map(model_config)
         self.update_tie_word_embeddings(
             model_path, model_config.hf_config, gguf_to_hf_name_map
         )
         weight_type_map = self.get_weight_type_map(model_path, gguf_to_hf_name_map)
+        unquantized_modules = self.get_unquantized_modules(weight_type_map)
+        unquantized_modules.extend(force_unquantized)
         self.load_spec = GGUFLoadSpec(
             weights_source=self._get_all_gguf_files(model_path),
             gguf_to_hf_name_map=gguf_to_hf_name_map,
-            unquantized_modules=self.get_unquantized_modules(weight_type_map),
+            unquantized_modules=unquantized_modules,
         )
         return self.load_spec
 
@@ -359,5 +381,24 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         weights = gguf_quant_weights_iterator_multi(
             self.load_spec.weights_source,
             self.load_spec.gguf_to_hf_name_map,
+            self.load_spec.unquantized_modules,
         )
-        yield from self.map_weights(weights)
+        mapped = self.map_weights(weights)
+        # Coalesce tensors that share the same HF name (GLM-5.2 indexer
+        # attn_k + proj both map to wk_weights_proj.weight).  Hold back at
+        # most one tensor — when the next has the same name, concatenate and
+        # yield; otherwise yield the held one.  Memory bounded to 2 tensors.
+        held_name: str | None = None
+        held_tensor: torch.Tensor | None = None
+        for name, tensor in mapped:
+            if name == held_name:
+                yield name, torch.cat([held_tensor, tensor], dim=0)
+                held_name = None
+                held_tensor = None
+            else:
+                if held_name is not None:
+                    yield held_name, held_tensor
+                held_name = name
+                held_tensor = tensor
+        if held_name is not None:
+            yield held_name, held_tensor
