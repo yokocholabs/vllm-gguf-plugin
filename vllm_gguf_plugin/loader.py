@@ -107,14 +107,30 @@ class GGUFModelLoader(BaseModelLoader):
     def _load_indexer_weights(
         model: nn.Module, indexer_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
-        """Load pre-fused indexer weights directly into model params."""
-        params_dict = dict(model.named_parameters())
+        """Load pre-fused indexer weights directly into model params.
+
+        Coalesce same-name tensors (attn_k + proj both map to
+        wk_weights_proj.weight) here — the prepare_weights coalescing
+        breaks when other indexer weights (wq_b, k_norm) are interspersed
+        between the two shards in the GGUF ordering.
+        """
+        # Group by name and coalesce (cat dim=0).
+        by_name: dict[str, torch.Tensor] = {}
         for name, tensor in indexer_weights:
-            # Strip "model." prefix if present — params_dict keys may
-            # or may not have it depending on model structure.
+            if name in by_name:
+                logger.debug(
+                    "Coalescing indexer shards for %s: cat([%s, %s], dim=0)",
+                    name, by_name[name].shape, tensor.shape,
+                )
+                by_name[name] = torch.cat([by_name[name], tensor], dim=0)
+            else:
+                by_name[name] = tensor
+
+        params_dict = dict(model.named_parameters())
+        for name, tensor in by_name.items():
+            # Try with and without "model." prefix.
             param_name = name
             if param_name not in params_dict:
-                # Try with and without "model." prefix
                 if param_name.startswith("model."):
                     param_name = param_name[len("model."):]
                 else:
@@ -126,17 +142,19 @@ class GGUFModelLoader(BaseModelLoader):
                 )
                 continue
             param = params_dict[param_name]
-            weight_loader = getattr(
-                param, "weight_loader", None
+            # Direct copy — bypasses weight_loader_v2 which would try to
+            # re-shard an already-fused tensor.  disable_tp=True means
+            # the param is full-size and replicated on all ranks.
+            if param.data.shape != tensor.shape:
+                logger.warning(
+                    "Indexer weight %s shape mismatch: param=%s tensor=%s, "
+                    "skipping", name, param.data.shape, tensor.shape,
+                )
+                continue
+            param.data.copy_(tensor)
+            logger.debug(
+                "Loaded indexer weight %s shape=%s", name, tensor.shape
             )
-            if weight_loader is not None:
-                # MergedColumnParallelLinear.weight_loader with
-                # shard_id=None means "already fused, copy directly".
-                weight_loader(param, tensor, None)
-            else:
-                # Fallback: direct copy
-                param.data.copy_(tensor)
-            logger.debug("Loaded indexer weight %s shape=%s", name, tensor.shape)
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
