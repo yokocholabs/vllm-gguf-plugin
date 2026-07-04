@@ -106,29 +106,20 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             # quant_config=None and disable_tp=True.  The GGUF stores them
             # as separate tensors: blk.{idx}.indexer.attn_k (Q8_0, the "wk"
             # shard) and blk.{idx}.indexer.proj (F32, the "weights_proj"
-            # shard).  Map to the UNFUSED shard names so vLLM's
-            # stacked_params_mapping fuses them via the MergedColumnParallel
-            # weight_loader(param, loaded_weight, shard_id).  Do NOT map to
-            # the fused name — "wk" in "wk_weights_proj" causes a substring
-            # collision in name.replace("wk", "wk_weights_proj").  Mark
-            # both shards as force_unquantized so the iterator dequantizes
-            # Q8_0 attn_k to fp32.  Add sideload regex for the fused
-            # state_dict name to suppress "Failed to map" errors.
+            # shard).  Map both to the FUSED HF name and coalesce in
+            # prepare_weights via torch.cat.  Use the default 2-arg
+            # weight_loader path — do NOT use unfused shard names +
+            # stacked_params_mapping (disable_tp=True creates [0] params
+            # on TP>1).  Mark as force_unquantized so the iterator
+            # dequantizes Q8_0 attn_k to fp32.
             for idx in range(config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.indexer.attn_k.weight"] = (
-                    f"model.layers.{idx}.self_attn.indexer.wk.weight"
+                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.indexer.proj.weight"] = (
-                    f"model.layers.{idx}.self_attn.indexer.weights_proj.weight"
+                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
                 )
-                sideload_params.append(
-                    regex.compile(
-                        f"model\\.layers\\.{idx}"
-                        r"\.self_attn\.indexer\.wk_weights_proj\.weight"
-                    )
-                )
-            force_unquantized_modules.append("indexer.wk")
-            force_unquantized_modules.append("indexer.weights_proj")
+            force_unquantized_modules.append("indexer.wk_weights_proj")
 
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
@@ -410,10 +401,31 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             self.load_spec.gguf_to_hf_name_map,
             self.load_spec.unquantized_modules,
         )
-        for name, tensor in self.map_weights(weights):
+        mapped = self.map_weights(weights)
+        # Coalesce tensors that share the same HF name (GLM-5.2 indexer
+        # attn_k + proj both map to wk_weights_proj.weight).  Concatenate
+        # along dim=0.  Memory bounded to 2 tensors at a time.
+        held_name: str | None = None
+        held_tensor: torch.Tensor | None = None
+        for name, tensor in mapped:
             if "indexer" in name:
                 logger.debug(
                     "GGUF indexer weight: %s shape=%s dtype=%s",
                     name, tensor.shape, tensor.dtype,
                 )
-            yield name, tensor
+            if name == held_name:
+                assert held_tensor is not None
+                logger.debug(
+                    "Coalescing indexer shards: %s cat([%s, %s], dim=0)",
+                    name, held_tensor.shape, tensor.shape,
+                )
+                yield name, torch.cat([held_tensor, tensor], dim=0)
+                held_name = None
+                held_tensor = None
+            else:
+                if held_name is not None:
+                    yield held_name, held_tensor
+                held_name = name
+                held_tensor = tensor
+        if held_name is not None:
+            yield held_name, held_tensor
