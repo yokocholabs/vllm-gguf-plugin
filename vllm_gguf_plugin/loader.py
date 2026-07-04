@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+from collections.abc import Iterable
 from typing import cast
 
 import torch
@@ -79,6 +80,82 @@ class GGUFModelLoader(BaseModelLoader):
         adapter = self._prepare_adapter(model_config)
         model.load_weights(adapter.prepare_weights(model_config))
 
+    @staticmethod
+    def _split_indexer_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> tuple[list[tuple[str, torch.Tensor]], Iterable[tuple[str, torch.Tensor]]]:
+        """Separate fused indexer weights from the main weight stream.
+
+        The plugin pre-fuses indexer wk + weights_proj into
+        wk_weights_proj.weight (dequantized, coalesced).  If these reach
+        vLLM's DeepseekV2Model.load_weights, the stacked_params_mapping
+        substring collision (``"wk" in "wk_weights_proj"``) doubles the
+        suffix.  We intercept them here and load them directly into model
+        params with shard_id=None ("already fused, copy directly"),
+        bypassing stacked_params_mapping entirely.
+        """
+        indexer_weights: list[tuple[str, torch.Tensor]] = []
+        other_weights: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            if ".indexer.wk_weights_proj.weight" in name:
+                indexer_weights.append((name, tensor))
+            else:
+                other_weights.append((name, tensor))
+        return indexer_weights, other_weights
+
+    @staticmethod
+    def _load_indexer_weights(
+        model: nn.Module, indexer_weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        """Load pre-fused indexer weights directly into model params.
+
+        Coalesce same-name tensors (attn_k + proj both map to
+        wk_weights_proj.weight) here — the prepare_weights coalescing
+        breaks when other indexer weights (wq_b, k_norm) are interspersed
+        between the two shards in the GGUF ordering.
+        """
+        # Group by name and coalesce (cat dim=0).
+        by_name: dict[str, torch.Tensor] = {}
+        for name, tensor in indexer_weights:
+            if name in by_name:
+                logger.debug(
+                    "Coalescing indexer shards for %s: cat([%s, %s], dim=0)",
+                    name, by_name[name].shape, tensor.shape,
+                )
+                by_name[name] = torch.cat([by_name[name], tensor], dim=0)
+            else:
+                by_name[name] = tensor
+
+        params_dict = dict(model.named_parameters())
+        for name, tensor in by_name.items():
+            # Try with and without "model." prefix.
+            param_name = name
+            if param_name not in params_dict:
+                if param_name.startswith("model."):
+                    param_name = param_name[len("model."):]
+                else:
+                    param_name = "model." + param_name
+            if param_name not in params_dict:
+                logger.warning(
+                    "Indexer weight %s not found in model params, skipping",
+                    name,
+                )
+                continue
+            param = params_dict[param_name]
+            # Direct copy — bypasses weight_loader_v2 which would try to
+            # re-shard an already-fused tensor.  disable_tp=True means
+            # the param is full-size and replicated on all ranks.
+            if param.data.shape != tensor.shape:
+                logger.warning(
+                    "Indexer weight %s shape mismatch: param=%s tensor=%s, "
+                    "skipping", name, param.data.shape, tensor.shape,
+                )
+                continue
+            param.data.copy_(tensor)
+            logger.debug(
+                "Loaded indexer weight %s shape=%s", name, tensor.shape
+            )
+
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
@@ -98,11 +175,28 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
 
-            # Stream weights through model.load_weights.
-            # Indexer wk+weights_proj fusion is handled by vLLM's
-            # stacked_params_mapping.  kv_b_proj K+V fusion is handled
-            # by prepare_weights coalescing.  No special interception needed.
-            model.load_weights(adapter.prepare_weights(model_config))
+            # Stream weights through model.load_weights, collecting only
+            # the small indexer tensors as a side effect.  Avoids
+            # materializing the full weight set into a list (OOM on 128GB).
+            indexer_weights: list[tuple[str, torch.Tensor]] = []
 
+            def _filtered(
+                weights: Iterable[tuple[str, torch.Tensor]],
+            ) -> Iterable[tuple[str, torch.Tensor]]:
+                for name, tensor in weights:
+                    if ".indexer.wk_weights_proj" in name:
+                        indexer_weights.append((name, tensor))
+                    else:
+                        yield name, tensor
+
+            model.load_weights(_filtered(adapter.prepare_weights(model_config)))
+
+            if indexer_weights:
+                logger.info(
+                    "Loading %d indexer weight tensors directly "
+                    "(bypassing stacked_params_mapping)",
+                    len(indexer_weights),
+                )
+                self._load_indexer_weights(model, indexer_weights)
             process_weights_after_loading(model, model_config, target_device)
         return model

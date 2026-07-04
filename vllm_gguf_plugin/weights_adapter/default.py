@@ -103,37 +103,31 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
 
             # GLM-5.2 DSA Indexer: vLLM fuses wk + weights_proj into
             # MergedColumnParallelLinear (wk_weights_proj) with
-            # quant_config=None, disable_tp=True.  The GGUF stores them
+            # quant_config=None and disable_tp=True.  The GGUF stores them
             # as separate tensors: blk.{idx}.indexer.attn_k (Q8_0, the "wk"
             # shard) and blk.{idx}.indexer.proj (F32, the "weights_proj"
-            # shard).  Map to the UNFUSED HF shard names so vLLM's
-            # stacked_params_mapping handles the fusion natively:
-            #   ("wk_weights_proj", "wk", 0)
-            #   ("wk_weights_proj", "weights_proj", 1)
-            # Dequantize attn_k Q8_0 → bf16 via force_unquantized_modules.
-            # weights_proj is already F32, no dequant needed.
+            # shard).  Map both to the FUSED HF name and coalesce in
+            # prepare_weights via torch.cat.  Use the default 2-arg
+            # weight_loader path — do NOT use unfused shard names +
+            # stacked_params_mapping (disable_tp=True creates [0] params
+            # on TP>1).  Mark as force_unquantized so the iterator
+            # dequantizes Q8_0 attn_k to fp32.
             for idx in range(config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.indexer.attn_k.weight"] = (
-                    f"model.layers.{idx}.self_attn.indexer.wk.weight"
+                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.indexer.proj.weight"] = (
-                    f"model.layers.{idx}.self_attn.indexer.weights_proj.weight"
+                    f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
                 )
-            # Dequant Q8_0 wk → bf16 (iterator path)
-            force_unquantized_modules.append("indexer.wk")
-            # Force UnquantizedLinearMethod for the fused layer
             force_unquantized_modules.append("indexer.wk_weights_proj")
 
-            # GLM-5.2 DSA MLA kv_b_proj: vLLM has a single 2D
-            # ColumnParallelLinear kv_b_proj [num_heads*(qk_nope+v_head),
-            # kv_lora_rank] with quant_config.  The GGUF stores K and V as
-            # SEPARATE 3D per-head tensors:
-            #   attn_k_b: [n_head, kv_lora_rank, qk_nope_head_dim] Q8_0
-            #   attn_v_b: [n_head, v_head_dim, kv_lora_rank]      Q8_0
-            # These have different shapes (K: in=192, V: in=512) so cannot
-            # be loaded as quantized shards.  Dequantize to bf16, reshape
-            # to 2D, and concatenate along dim=0 in prepare_weights.
-            # Memory: bf16 not fp32, streaming (1 layer at a time).
+            # GLM-5.2 DSA MLA: vLLM fuses K and V projections into a single
+            # kv_b_proj (ColumnParallelLinear with quant_config).  The GGUF
+            # stores them separately as blk.{idx}.attn_k_b (Q8_0) and
+            # blk.{idx}.attn_v_b (Q8_0).  Map both to the FUSED HF name
+            # (kv_b_proj) and coalesce in prepare_weights.  Mark as
+            # force_unquantized so the iterator dequantizes both Q8_0
+            # shards to fp32 before concatenation.
             for idx in range(config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.attn_k_b.weight"] = (
                     f"model.layers.{idx}.self_attn.kv_b_proj.weight"
@@ -141,7 +135,6 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 gguf_to_hf_name_map[f"blk.{idx}.attn_v_b.weight"] = (
                     f"model.layers.{idx}.self_attn.kv_b_proj.weight"
                 )
-            # Dequant Q8_0 → bf16 (iterator path)
             force_unquantized_modules.append("self_attn.kv_b_proj")
 
         if model_type in ("deepseek_v3", "deepseek_v2"):
@@ -426,9 +419,11 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         )
         mapped = self.map_weights(weights)
         # Only kv_b_proj needs pairing (attn_k_b + attn_v_b map to the
-        # same name but are NOT adjacent in GGUF ordering).  Everything
-        # else streams directly to avoid accumulating the full model
-        # in RAM.
+        # same name but are NOT adjacent in GGUF ordering — 7 tensors
+        # separate them).  Indexer wk_weights_proj shards are handled by
+        # the loader intercept (_load_indexer_weights coalesces them).
+        # Everything else streams directly to avoid accumulating the
+        # full model in RAM.
         kv_b_held: tuple[str, torch.Tensor] | None = None
         for name, tensor in mapped:
             if "indexer" in name or "kv_b_proj" in name:
@@ -474,7 +469,9 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                     # First shard (K) — hold until V arrives.
                     kv_b_held = (name, tensor)
             else:
-                # All other weights stream directly.
+                # All other weights (including indexer wk_weights_proj
+                # shards) stream directly.  The loader intercepts
+                # indexer weights and coalesces them there.
                 yield name, tensor
         # Flush any remaining held kv_b_proj (shouldn't happen).
         if kv_b_held is not None:

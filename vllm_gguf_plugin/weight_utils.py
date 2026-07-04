@@ -148,6 +148,13 @@ def gguf_quant_weights_iterator_multi(
                     for mod in unquantized_modules
                 )
             )
+            if "indexer" in name:
+                logger.debug(
+                    "GGUF indexer tensor: gguf=%s hf_name=%s type=%s "
+                    "is_unquant_module=%s unquantized_modules=%s",
+                    tensor.name, name, weight_type.name,
+                    is_unquant_module, unquantized_modules,
+                )
             if is_unquant_module:
                 from gguf import GGML_QUANT_SIZES
 
@@ -155,33 +162,15 @@ def gguf_quant_weights_iterator_multi(
 
                 block_size, type_size = GGML_QUANT_SIZES[weight_type]
                 raw = torch.tensor(tensor.data)
-                # For 3D per-head tensors (e.g. GLM-5.2 attn_k_b
-                # [n_head, kv_lora, qk_nope_packed]), dequant each
-                # row independently by reshaping to 2D, dequanting,
-                # then reshaping back to 3D.  This preserves the
-                # per-head structure for prepare_weights to transpose.
-                if raw.dim() > 2:
-                    leading = raw.shape[:-1]
-                    packed_cols = raw.shape[-1]
-                    raw_2d = raw.reshape(-1, packed_cols)
-                    rows = raw_2d.shape[0]
-                    cols = packed_cols // type_size * block_size
-                    dequant_2d = ggml_dequantize(
-                        raw_2d.cuda(), weight_type, rows, cols,
-                        torch.bfloat16,
-                    ).cpu()
-                    # Reshape back to 3D: [leading_dims..., dequant_cols]
-                    param = dequant_2d.reshape(*leading, cols)
-                else:
-                    rows = raw.shape[0]
-                    cols = raw.shape[-1] // type_size * block_size
-                    param = ggml_dequantize(
-                        raw.cuda(), weight_type, rows, cols, torch.bfloat16
-                    ).cpu()
+                rows = raw.shape[0] if raw.dim() > 1 else 1
+                cols = raw.shape[-1] // type_size * block_size
                 logger.debug(
-                    "Dequantized %s: %s -> bf16 %s",
-                    name, weight_type.name, tuple(param.shape),
+                    "Dequantizing %s: %s %s -> bf16 shape [%s, %s]",
+                    name, weight_type.name, tuple(raw.shape), rows, cols,
                 )
+                param = ggml_dequantize(
+                    raw.cuda(), weight_type, rows, cols, torch.bfloat16
+                ).cpu()
                 yield name, param
                 continue
 
