@@ -374,6 +374,17 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             gguf_to_hf_name_map=gguf_to_hf_name_map,
             unquantized_modules=unquantized_modules,
         )
+        logger.debug(
+            "GGUFLoadSpec: unquantized_modules=%s",
+            unquantized_modules,
+        )
+        # Log indexer-specific mappings for debugging
+        indexer_maps = {
+            k: v for k, v in gguf_to_hf_name_map.items()
+            if "indexer" in k or "indexer" in v
+        }
+        if indexer_maps:
+            logger.debug("GGUF indexer name mappings: %s", indexer_maps)
         return self.load_spec
 
     def prepare_weights(

@@ -120,6 +120,11 @@ def gguf_quant_weights_iterator_multi(
     """
     _QUANT_TYPES = ("F32", "BF16", "F16")
 
+    logger.debug(
+        "gguf_quant_weights_iterator_multi: files=%s unquantized_modules=%s",
+        [os.path.basename(f) for f in gguf_files], unquantized_modules,
+    )
+
     for gguf_file in gguf_files:
         reader = gguf.GGUFReader(gguf_file)
         for tensor in reader.tensors:
@@ -135,14 +140,22 @@ def gguf_quant_weights_iterator_multi(
             # Dequantize tensors belonging to modules marked as unquantized
             # but stored quantized in the GGUF (e.g. GLM-5.2 indexer
             # wk/weights_proj with Q8_0).  Yield as .weight, not .qweight.
-            if (
+            is_unquant_module = (
                 weight_type.name not in _QUANT_TYPES
                 and unquantized_modules
                 and any(
                     mod in name.removesuffix(".weight")
                     for mod in unquantized_modules
                 )
-            ):
+            )
+            if "indexer" in name:
+                logger.debug(
+                    "GGUF indexer tensor: gguf=%s hf_name=%s type=%s "
+                    "is_unquant_module=%s unquantized_modules=%s",
+                    tensor.name, name, weight_type.name,
+                    is_unquant_module, unquantized_modules,
+                )
+            if is_unquant_module:
                 from gguf import GGML_QUANT_SIZES
 
                 from vllm_gguf_plugin.ops import ggml_dequantize
