@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+from collections.abc import Iterable
 from typing import cast
 
 import torch
@@ -79,6 +80,64 @@ class GGUFModelLoader(BaseModelLoader):
         adapter = self._prepare_adapter(model_config)
         model.load_weights(adapter.prepare_weights(model_config))
 
+    @staticmethod
+    def _split_indexer_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> tuple[list[tuple[str, torch.Tensor]], Iterable[tuple[str, torch.Tensor]]]:
+        """Separate fused indexer weights from the main weight stream.
+
+        The plugin pre-fuses indexer wk + weights_proj into
+        wk_weights_proj.weight (dequantized, coalesced).  If these reach
+        vLLM's DeepseekV2Model.load_weights, the stacked_params_mapping
+        substring collision (``"wk" in "wk_weights_proj"``) doubles the
+        suffix.  We intercept them here and load them directly into model
+        params with shard_id=None ("already fused, copy directly"),
+        bypassing stacked_params_mapping entirely.
+        """
+        indexer_weights: list[tuple[str, torch.Tensor]] = []
+        other_weights: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            if ".indexer.wk_weights_proj.weight" in name:
+                indexer_weights.append((name, tensor))
+            else:
+                other_weights.append((name, tensor))
+        return indexer_weights, other_weights
+
+    @staticmethod
+    def _load_indexer_weights(
+        model: nn.Module, indexer_weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        """Load pre-fused indexer weights directly into model params."""
+        params_dict = dict(model.named_parameters())
+        for name, tensor in indexer_weights:
+            # Strip "model." prefix if present — params_dict keys may
+            # or may not have it depending on model structure.
+            param_name = name
+            if param_name not in params_dict:
+                # Try with and without "model." prefix
+                if param_name.startswith("model."):
+                    param_name = param_name[len("model."):]
+                else:
+                    param_name = "model." + param_name
+            if param_name not in params_dict:
+                logger.warning(
+                    "Indexer weight %s not found in model params, skipping",
+                    name,
+                )
+                continue
+            param = params_dict[param_name]
+            weight_loader = getattr(
+                param, "weight_loader", None
+            )
+            if weight_loader is not None:
+                # MergedColumnParallelLinear.weight_loader with
+                # shard_id=None means "already fused, copy directly".
+                weight_loader(param, tensor, None)
+            else:
+                # Fallback: direct copy
+                param.data.copy_(tensor)
+            logger.debug("Loaded indexer weight %s shape=%s", name, tensor.shape)
+
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
@@ -97,8 +156,21 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
-            model.load_weights(
-                adapter.prepare_weights(model_config),
-            )
+
+                # Intercept indexer weights to bypass stacked_params_mapping
+                # substring collision in DeepseekV2Model.load_weights.
+                all_weights = list(adapter.prepare_weights(model_config))
+                indexer_weights, other_weights = self._split_indexer_weights(
+                    all_weights
+                )
+                if indexer_weights:
+                    logger.info(
+                        "Loading %d indexer weight tensors directly "
+                        "(bypassing stacked_params_mapping)",
+                        len(indexer_weights),
+                    )
+                    self._load_indexer_weights(model, indexer_weights)
+
+                model.load_weights(other_weights)
             process_weights_after_loading(model, model_config, target_device)
         return model
