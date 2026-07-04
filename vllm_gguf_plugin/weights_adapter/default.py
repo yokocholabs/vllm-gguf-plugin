@@ -121,6 +121,22 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 )
             force_unquantized_modules.append("indexer.wk_weights_proj")
 
+            # GLM-5.2 DSA MLA: vLLM fuses K and V projections into a single
+            # kv_b_proj (ColumnParallelLinear with quant_config).  The GGUF
+            # stores them separately as blk.{idx}.attn_k_b (Q8_0) and
+            # blk.{idx}.attn_v_b (Q8_0).  Map both to the FUSED HF name
+            # (kv_b_proj) and coalesce in prepare_weights.  Mark as
+            # force_unquantized so the iterator dequantizes both Q8_0
+            # shards to fp32 before concatenation.
+            for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.attn_k_b.weight"] = (
+                    f"model.layers.{idx}.self_attn.kv_b_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_v_b.weight"] = (
+                    f"model.layers.{idx}.self_attn.kv_b_proj.weight"
+                )
+            force_unquantized_modules.append("self_attn.kv_b_proj")
+
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             for idx in range(config.num_hidden_layers):
