@@ -425,55 +425,57 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             self.load_spec.unquantized_modules,
         )
         mapped = self.map_weights(weights)
-        # Buffer tensors that share the same HF name (e.g. GLM-5.2
-        # kv_b_proj: attn_k_b and attn_v_b both map to kv_b_proj.weight
-        # but are NOT adjacent in GGUF ordering — 7 tensors separate them).
-        # Hold pending tensors in a dict until the pair completes, then
-        # reshape and concat.  Memory: 1 layer's worth at a time.
-        pending: dict[str, list[torch.Tensor]] = {}
+        # Only kv_b_proj needs pairing (attn_k_b + attn_v_b map to the
+        # same name but are NOT adjacent in GGUF ordering).  Everything
+        # else streams directly to avoid accumulating the full model
+        # in RAM.
+        kv_b_held: tuple[str, torch.Tensor] | None = None
         for name, tensor in mapped:
             if "indexer" in name or "kv_b_proj" in name:
                 logger.debug(
                     "GGUF weight: %s shape=%s dtype=%s",
                     name, tensor.shape, tensor.dtype,
                 )
-            if name in pending:
-                # Second shard arrived — coalesce.
-                shards = pending.pop(name)
-                # GLM-5.2 kv_b_proj: K and V are 3D per-head tensors.
-                # K: [n_head, kv_lora, qk_nope] -> transpose(1,2) ->
-                #    [n_head, qk_nope, kv_lora] -> [n_head*qk_nope, kv_lora]
-                # V: [n_head, v_head, kv_lora] -> [n_head*v_head, kv_lora]
-                # Then cat dim=0 -> [n_head*(qk_nope+v_head), kv_lora]
-                a = shards[0]
-                b = tensor
-                if a.dim() == 3 and b.dim() == 3:
-                    if a.shape[1] == b.shape[2]:
-                        # a=K [n_head, kv_lora, qk_nope],
-                        # b=V [n_head, v_head, kv_lora]
-                        a2 = a.transpose(1, 2).reshape(
-                            a.shape[0] * a.shape[2], a.shape[1])
-                        b2 = b.reshape(b.shape[0] * b.shape[1], b.shape[2])
-                    elif a.shape[2] == b.shape[1]:
-                        # a=V, b=K (V came first)
-                        a2 = a.reshape(a.shape[0] * a.shape[1], a.shape[2])
-                        b2 = b.transpose(1, 2).reshape(
-                            b.shape[0] * b.shape[2], b.shape[1])
+            if "kv_b_proj.weight" in name:
+                if kv_b_held is not None:
+                    # Second shard (V) arrived — coalesce with held K.
+                    a = kv_b_held[1]
+                    b = tensor
+                    # K: [n_head, kv_lora, qk_nope] -> transpose(1,2) ->
+                    #    [n_head, qk_nope, kv_lora] -> [n_head*qk_nope, kv_lora]
+                    # V: [n_head, v_head, kv_lora] -> [n_head*v_head, kv_lora]
+                    if a.dim() == 3 and b.dim() == 3:
+                        if a.shape[1] == b.shape[2]:
+                            # a=K, b=V
+                            a2 = a.transpose(1, 2).reshape(
+                                a.shape[0] * a.shape[2], a.shape[1])
+                            b2 = b.reshape(
+                                b.shape[0] * b.shape[1], b.shape[2])
+                        elif a.shape[2] == b.shape[1]:
+                            # a=V, b=K
+                            a2 = a.reshape(
+                                a.shape[0] * a.shape[1], a.shape[2])
+                            b2 = b.transpose(1, 2).reshape(
+                                b.shape[0] * b.shape[2], b.shape[1])
+                        else:
+                            a2 = a.reshape(
+                                a.shape[0] * a.shape[1], a.shape[2])
+                            b2 = b.reshape(
+                                b.shape[0] * b.shape[1], b.shape[2])
                     else:
-                        a2 = a.reshape(a.shape[0] * a.shape[1], a.shape[2])
-                        b2 = b.reshape(b.shape[0] * b.shape[1], b.shape[2])
+                        a2, b2 = a, b
+                    logger.debug(
+                        "Coalescing %s: cat([%s, %s], dim=0)",
+                        name, a2.shape, b2.shape,
+                    )
+                    yield name, torch.cat([a2, b2], dim=0)
+                    kv_b_held = None
                 else:
-                    a2 = a
-                    b2 = b
-                logger.debug(
-                    "Coalescing %s: cat([%s, %s], dim=0)",
-                    name, a2.shape, b2.shape,
-                )
-                yield name, torch.cat([a2, b2], dim=0)
+                    # First shard (K) — hold until V arrives.
+                    kv_b_held = (name, tensor)
             else:
-                # First occurrence — could be a paired shard or a solo.
-                # Buffer it; if no pair arrives, yield at end.
-                pending[name] = [tensor]
-        # Yield any unpaired tensors.
-        for name, shards in pending.items():
-            yield name, shards[0]
+                # All other weights stream directly.
+                yield name, tensor
+        # Flush any remaining held kv_b_proj (shouldn't happen).
+        if kv_b_held is not None:
+            yield kv_b_held[0], kv_b_held[1]
