@@ -425,34 +425,29 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             self.load_spec.unquantized_modules,
         )
         mapped = self.map_weights(weights)
-        # Coalesce tensors that share the same HF name.
-        # Two cases:
-        #   1. kv_b_proj: attn_k_b (3D [n_head, kv_lora, qk_nope]) and
-        #      attn_v_b (3D [n_head, v_head, kv_lora]) both map to
-        #      kv_b_proj.weight.  Reshape each to 2D and concat dim=0.
-        #   2. Any other same-name duplicates: concat dim=0.
-        # Memory bounded: hold max 1 tensor at a time (streaming).
-        held_name: str | None = None
-        held_tensor: torch.Tensor | None = None
+        # Buffer tensors that share the same HF name (e.g. GLM-5.2
+        # kv_b_proj: attn_k_b and attn_v_b both map to kv_b_proj.weight
+        # but are NOT adjacent in GGUF ordering — 7 tensors separate them).
+        # Hold pending tensors in a dict until the pair completes, then
+        # reshape and concat.  Memory: 1 layer's worth at a time.
+        pending: dict[str, list[torch.Tensor]] = {}
         for name, tensor in mapped:
             if "indexer" in name or "kv_b_proj" in name:
                 logger.debug(
                     "GGUF weight: %s shape=%s dtype=%s",
                     name, tensor.shape, tensor.dtype,
                 )
-            if name == held_name:
-                assert held_tensor is not None
-                a = held_tensor
-                b = tensor
+            if name in pending:
+                # Second shard arrived — coalesce.
+                shards = pending.pop(name)
                 # GLM-5.2 kv_b_proj: K and V are 3D per-head tensors.
                 # K: [n_head, kv_lora, qk_nope] -> transpose(1,2) ->
                 #    [n_head, qk_nope, kv_lora] -> [n_head*qk_nope, kv_lora]
-                # V: [n_head, v_head, kv_lora] ->
-                #    [n_head*v_head, kv_lora]
+                # V: [n_head, v_head, kv_lora] -> [n_head*v_head, kv_lora]
                 # Then cat dim=0 -> [n_head*(qk_nope+v_head), kv_lora]
+                a = shards[0]
+                b = tensor
                 if a.dim() == 3 and b.dim() == 3:
-                    # Detect K (in=kv_lora, out=qk_nope): middle dim
-                    # differs from V's last dim
                     if a.shape[1] == b.shape[2]:
                         # a=K [n_head, kv_lora, qk_nope],
                         # b=V [n_head, v_head, kv_lora]
@@ -475,12 +470,10 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                     name, a2.shape, b2.shape,
                 )
                 yield name, torch.cat([a2, b2], dim=0)
-                held_name = None
-                held_tensor = None
             else:
-                if held_name is not None:
-                    yield held_name, held_tensor
-                held_name = name
-                held_tensor = tensor
-        if held_name is not None:
-            yield held_name, held_tensor
+                # First occurrence — could be a paired shard or a solo.
+                # Buffer it; if no pair arrives, yield at end.
+                pending[name] = [tensor]
+        # Yield any unpaired tensors.
+        for name, shards in pending.items():
+            yield name, shards[0]
