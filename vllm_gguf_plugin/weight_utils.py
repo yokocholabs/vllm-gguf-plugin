@@ -134,7 +134,7 @@ def gguf_quant_weights_iterator_multi(
 
             # Dequantize tensors belonging to modules marked as unquantized
             # but stored quantized in the GGUF (e.g. GLM-5.2 indexer
-            # wk/weights_proj with IQ1_S).  Yield as .weight, not .qweight.
+            # wk/weights_proj with Q8_0).  Yield as .weight, not .qweight.
             if (
                 weight_type.name not in _QUANT_TYPES
                 and unquantized_modules
@@ -151,6 +151,10 @@ def gguf_quant_weights_iterator_multi(
                 raw = torch.tensor(tensor.data)
                 rows = raw.shape[0] if raw.dim() > 1 else 1
                 cols = raw.shape[-1] // type_size * block_size
+                logger.debug(
+                    "Dequantizing %s: %s %s -> fp32 shape [%s, %s]",
+                    name, weight_type.name, tuple(raw.shape), rows, cols,
+                )
                 param = ggml_dequantize(
                     raw.cuda(), weight_type, rows, cols, torch.float32
                 ).cpu()
