@@ -157,14 +157,22 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
 
-            # Prepare weights outside target_device context so torch.tensor()
-            # defaults to CPU — the dequantize path in weight_utils does
-            # .cuda() then .cpu(), while F32 tensors stay on the default
-            # device.  Mixing devices breaks torch.cat in prepare_weights.
-            all_weights = list(adapter.prepare_weights(model_config))
-            indexer_weights, other_weights = self._split_indexer_weights(
-                all_weights
-            )
+            # Stream weights through model.load_weights, collecting only
+            # the small indexer tensors as a side effect.  Avoids
+            # materializing the full weight set into a list (OOM on 128GB).
+            indexer_weights: list[tuple[str, torch.Tensor]] = []
+
+            def _filtered(
+                weights: Iterable[tuple[str, torch.Tensor]],
+            ) -> Iterable[tuple[str, torch.Tensor]]:
+                for name, tensor in weights:
+                    if ".indexer.wk_weights_proj.weight" in name:
+                        indexer_weights.append((name, tensor))
+                    else:
+                        yield name, tensor
+
+            model.load_weights(_filtered(adapter.prepare_weights(model_config)))
+
             if indexer_weights:
                 logger.info(
                     "Loading %d indexer weight tensors directly "
@@ -172,7 +180,5 @@ class GGUFModelLoader(BaseModelLoader):
                     len(indexer_weights),
                 )
                 self._load_indexer_weights(model, indexer_weights)
-
-            model.load_weights(other_weights)
             process_weights_after_loading(model, model_config, target_device)
         return model
