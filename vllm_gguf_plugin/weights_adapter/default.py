@@ -275,7 +275,10 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         for hf_name in state_dict:
             gguf_name_with_suffix = find_hf_name_in_tensor_map(hf_name)
             if gguf_name_with_suffix is not None:
-                gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
+                # Don't overwrite explicit mappings (e.g. GLM-5.2 indexer
+                # fused wk_weights_proj that differ from gguf lib defaults).
+                if gguf_name_with_suffix not in gguf_to_hf_name_map:
+                    gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
                 logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
             elif hf_name not in gguf_to_hf_name_map.values():
                 unmapped_params.append(hf_name)
