@@ -22,6 +22,12 @@ missing (all present in the SM100 impl, flashinfer_mla_sparse.py):
 Rows whose top-k tokens all live on other ranks get out=0 / lse=-inf so
 they contribute nothing to the combine (mirrors SM100).
 
+Unlike upstream SM120, no ``out=`` buffer is passed: under the ag_rs DCP
+comm backend the query arrives already all-gathered across the DCP group
+(``num_heads * dcp_world_size`` heads), so any buffer sized from
+``self.num_heads`` is wrong for DCP>1. FlashInfer allocates the output
+from the query shape itself (same as the SM100 impl).
+
 At DCP=1 the patched ``forward_mqa`` is behavior-identical to upstream:
 same index conversion call, ``seq_lens=None``, no LSE request.
 """
@@ -102,11 +108,6 @@ def apply_sm120_dcp_patch() -> None:
             )
             seq_lens = None
 
-        output = q.new_empty(
-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
-            dtype=q.dtype,
-        )
-
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)
 
@@ -124,7 +125,6 @@ def apply_sm120_dcp_patch() -> None:
             block_tables=topk_indices_physical.unsqueeze(1),
             seq_lens=seq_lens,
             max_seq_len=attn_metadata.topk_tokens,
-            out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
             sparse_mla_top_k=attn_metadata.topk_tokens,
