@@ -23,6 +23,7 @@ from .config_parser import GGUFConfigParser
 from .gguf_utils import check_gguf_file, is_gguf, is_remote_gguf, split_remote_gguf
 from .loader import GGUFModelLoader
 from .quantization import GGUFConfig
+from .sm120_dcp import apply_sm120_dcp_patch
 
 OOTGGUFConfig = GGUFConfig
 OOTGGUFModelLoader = GGUFModelLoader
@@ -121,3 +122,4 @@ def register() -> None:
         register_config_parser("gguf")(GGUFConfigParser)
     _patch_engine_args()
     _patch_speculator_probe()
+    apply_sm120_dcp_patch()
