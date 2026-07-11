@@ -120,7 +120,9 @@ class GGUFModelLoader(BaseModelLoader):
             if name in by_name:
                 logger.debug(
                     "Coalescing indexer shards for %s: cat([%s, %s], dim=0)",
-                    name, by_name[name].shape, tensor.shape,
+                    name,
+                    by_name[name].shape,
+                    tensor.shape,
                 )
                 by_name[name] = torch.cat([by_name[name], tensor], dim=0)
             else:
@@ -128,14 +130,35 @@ class GGUFModelLoader(BaseModelLoader):
 
         params_dict = dict(model.named_parameters())
         for name, tensor in by_name.items():
-            # Try with and without "model." prefix.
-            param_name = name
-            if param_name not in params_dict:
-                if param_name.startswith("model."):
-                    param_name = param_name[len("model."):]
-                else:
-                    param_name = "model." + param_name
-            if param_name not in params_dict:
+            # Try the mapped name, its model-prefix variant, and the
+            # MTP decoder-block location used after DeepSeekMTP rewrites.
+            candidates = [name]
+            if name.startswith("model."):
+                candidates.append(name[len("model.") :])
+            else:
+                candidates.append("model." + name)
+            for candidate in tuple(candidates):
+                if ".self_attn." in candidate:
+                    candidates.append(
+                        candidate.replace(".self_attn.", ".mtp_block.self_attn.", 1)
+                    )
+
+            param_name = next(
+                (candidate for candidate in candidates if candidate in params_dict),
+                None,
+            )
+            if param_name is None:
+                mtp_prefixes = tuple(
+                    candidate.split(".self_attn.", 1)[0] + ".mtp_block."
+                    for candidate in candidates[:2]
+                    if ".self_attn." in candidate
+                )
+                if mtp_prefixes and any(
+                    parameter.startswith(mtp_prefixes) for parameter in params_dict
+                ):
+                    raise ValueError(
+                        f"Required MTP indexer weight {name} not found in model params"
+                    )
                 logger.warning(
                     "Indexer weight %s not found in model params, skipping",
                     name,
@@ -146,15 +169,12 @@ class GGUFModelLoader(BaseModelLoader):
             # re-shard an already-fused tensor.  disable_tp=True means
             # the param is full-size and replicated on all ranks.
             if param.data.shape != tensor.shape:
-                logger.warning(
-                    "Indexer weight %s shape mismatch: param=%s tensor=%s, "
-                    "skipping", name, param.data.shape, tensor.shape,
+                raise ValueError(
+                    f"Indexer weight {name} shape mismatch: "
+                    f"param={param.data.shape} tensor={tensor.shape}"
                 )
-                continue
             param.data.copy_(tensor)
-            logger.debug(
-                "Loaded indexer weight %s shape=%s", name, tensor.shape
-            )
+            logger.debug("Loaded indexer weight %s shape=%s", name, tensor.shape)
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""

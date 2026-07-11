@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
 import torch
 import vllm.engine.arg_utils as arg_utils_module
 import vllm.model_executor.layers.vocab_parallel_embedding as vocab_embedding_module
@@ -23,6 +24,7 @@ import vllm_gguf_plugin.quantization as gguf_quantization
 import vllm_gguf_plugin.weights_adapter.default as default_adapter_module
 from vllm_gguf_plugin import OOTGGUFConfig, OOTGGUFModelLoader, register
 from vllm_gguf_plugin.config_parser import GGUFConfigParser
+from vllm_gguf_plugin.loader import GGUFModelLoader
 from vllm_gguf_plugin.quantization import (
     GGUFUninitializedParameter,
     GGUFWeightParameter,
@@ -361,3 +363,62 @@ def test_gguf_pp_filter_uses_vllm_missing_parameter_predicate(monkeypatch):
     assert adapter.load_spec.gguf_to_hf_name_map == {
         "blk.0.weight": "model.layers.0.weight"
     }
+
+
+def _mtp_indexer_model() -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleDict({"78": torch.nn.Module()})
+    layer = model.model.layers["78"]
+    layer.mtp_block = torch.nn.Module()
+    layer.mtp_block.probe = torch.nn.Linear(1, 1, bias=False)
+    layer.mtp_block.self_attn = torch.nn.Module()
+    layer.mtp_block.self_attn.indexer = torch.nn.Module()
+    layer.mtp_block.self_attn.indexer.wk_weights_proj = torch.nn.Linear(
+        4, 3, bias=False
+    )
+    return model
+
+
+def test_indexer_loader_resolves_mtp_block():
+    model = _mtp_indexer_model()
+    mapped_name = "model.layers.78.self_attn.indexer.wk_weights_proj.weight"
+    wk = torch.ones((2, 4))
+    weights_proj = 2 * torch.ones((1, 4))
+
+    GGUFModelLoader._load_indexer_weights(
+        model,
+        [(mapped_name, wk), (mapped_name, weights_proj)],
+    )
+
+    actual = dict(model.named_parameters())[
+        "model.layers.78.mtp_block.self_attn.indexer.wk_weights_proj.weight"
+    ]
+    assert torch.equal(actual[:2], wk)
+    assert torch.equal(actual[2:], weights_proj)
+
+
+def test_indexer_loader_rejects_shape_mismatch():
+    model = _mtp_indexer_model()
+    mapped_name = "model.layers.78.self_attn.indexer.wk_weights_proj.weight"
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        GGUFModelLoader._load_indexer_weights(
+            model,
+            [
+                (mapped_name, torch.ones((2, 4))),
+                (mapped_name, torch.ones((2, 4))),
+            ],
+        )
+
+
+def test_indexer_loader_rejects_missing_mtp_parameter():
+    model = _mtp_indexer_model()
+    del model.model.layers["78"].mtp_block.self_attn.indexer.wk_weights_proj
+    mapped_name = "model.layers.78.self_attn.indexer.wk_weights_proj.weight"
+
+    with pytest.raises(ValueError, match="Required MTP indexer weight"):
+        GGUFModelLoader._load_indexer_weights(
+            model,
+            [(mapped_name, torch.ones((3, 4)))],
+        )
