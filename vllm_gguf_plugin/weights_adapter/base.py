@@ -49,6 +49,10 @@ class BaseGGUFWeightsAdapter(ABC):
         del model_path
         return hf_config
 
+    def restrict_to_model(self, model: torch.nn.Module) -> None:
+        """Restrict loading to parameters materialized on this pipeline rank."""
+        del model
+
     def transform_weight(
         self,
         hf_name: str,

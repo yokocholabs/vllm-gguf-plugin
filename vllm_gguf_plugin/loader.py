@@ -175,6 +175,9 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
 
+            if vllm_config.parallel_config.pipeline_parallel_size > 1:
+                adapter.restrict_to_model(model)
+
             # Stream weights through model.load_weights, collecting only
             # the small indexer tensors as a side effect.  Avoids
             # materializing the full weight set into a list (OOM on 128GB).

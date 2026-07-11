@@ -20,6 +20,7 @@ from vllm.transformers_utils.config import get_config_parser
 
 import vllm_gguf_plugin.config_parser as gguf_config_parser_module
 import vllm_gguf_plugin.quantization as gguf_quantization
+import vllm_gguf_plugin.weights_adapter.default as default_adapter_module
 from vllm_gguf_plugin import OOTGGUFConfig, OOTGGUFModelLoader, register
 from vllm_gguf_plugin.config_parser import GGUFConfigParser
 from vllm_gguf_plugin.quantization import (
@@ -323,3 +324,40 @@ def test_gguf_linear_preserves_cuda_weight_device(monkeypatch):
 
     assert layer.qweight.device.type == "cuda"
     assert layer.qweight_type.device.type == "cuda"
+
+
+def test_gguf_pp_filter_uses_vllm_missing_parameter_predicate(monkeypatch):
+    adapter = default_adapter_module.GGUFWeightsAdapter.__new__(
+        default_adapter_module.GGUFWeightsAdapter
+    )
+    original_map = {
+        "blk.0.weight": "model.layers.0.weight",
+        "blk.40.weight": "model.layers.40.weight",
+        "output.weight": "lm_head.weight",
+    }
+    adapter.load_spec = default_adapter_module.GGUFLoadSpec(
+        weights_source=[],
+        unquantized_modules=[],
+        gguf_to_hf_name_map=original_map.copy(),
+    )
+    model = torch.nn.Module()
+    missing = {"model.layers.40.weight", "lm_head.weight"}
+    checked = []
+
+    def fake_is_pp_missing_parameter(name, candidate_model):
+        assert candidate_model is model
+        checked.append(name)
+        return name in missing
+
+    monkeypatch.setattr(
+        default_adapter_module,
+        "is_pp_missing_parameter",
+        fake_is_pp_missing_parameter,
+    )
+
+    adapter.restrict_to_model(model)
+
+    assert checked == list(original_map.values())
+    assert adapter.load_spec.gguf_to_hf_name_map == {
+        "blk.0.weight": "model.layers.0.weight"
+    }

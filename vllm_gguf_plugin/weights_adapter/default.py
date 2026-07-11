@@ -13,6 +13,7 @@ import regex
 import torch
 from transformers import AutoModelForCausalLM
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import is_pp_missing_parameter
 
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
 from ..weight_utils import (
@@ -406,6 +407,29 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         if indexer_maps:
             logger.debug("GGUF indexer name mappings: %s", indexer_maps)
         return self.load_spec
+
+    def restrict_to_model(self, model: torch.nn.Module) -> None:
+        """Drop mappings owned by another native vLLM pipeline stage.
+
+        vLLM materializes nonlocal modules as PPMissingLayer instances.
+        Filtering before the GGUF iterator touches tensor data prevents this
+        rank from dequantizing or transferring weights that vLLM will skip.
+        """
+        if self.load_spec is None:
+            return
+
+        original = self.load_spec.gguf_to_hf_name_map
+        filtered = {
+            gguf_name: hf_name
+            for gguf_name, hf_name in original.items()
+            if not is_pp_missing_parameter(hf_name, model)
+        }
+        self.load_spec.gguf_to_hf_name_map = filtered
+        logger.info(
+            "Pipeline-local GGUF map: retained %d/%d tensors",
+            len(filtered),
+            len(original),
+        )
 
     def prepare_weights(
         self,
