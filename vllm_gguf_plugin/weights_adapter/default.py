@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 logger = init_logger(__name__)
+progress_logger = init_logger("vllm.gguf_plugin.progress")
+_LAYER_NAME_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
@@ -442,6 +444,14 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             self.load_spec.unquantized_modules,
         )
         mapped = self.map_weights(weights)
+        local_layers = sorted(
+            {
+                int(match.group(1))
+                for name in self.load_spec.gguf_to_hf_name_map.values()
+                if (match := _LAYER_NAME_RE.search(name)) is not None
+            }
+        )
+        reported_layers: set[int] = set()
         # Only kv_b_proj needs pairing (attn_k_b + attn_v_b map to the
         # same name but are NOT adjacent in GGUF ordering — 7 tensors
         # separate them).  Indexer wk_weights_proj shards are handled by
@@ -450,6 +460,17 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         # full model in RAM.
         kv_b_held: tuple[str, torch.Tensor] | None = None
         for name, tensor in mapped:
+            layer_match = _LAYER_NAME_RE.search(name)
+            if layer_match is not None:
+                layer_idx = int(layer_match.group(1))
+                if layer_idx not in reported_layers:
+                    reported_layers.add(layer_idx)
+                    progress_logger.info(
+                        "Loading GGUF layer %d (%d/%d on this pipeline stage)",
+                        layer_idx,
+                        len(reported_layers),
+                        len(local_layers),
+                    )
             if "indexer" in name or "kv_b_proj" in name:
                 logger.debug(
                     "GGUF weight: %s shape=%s dtype=%s",
