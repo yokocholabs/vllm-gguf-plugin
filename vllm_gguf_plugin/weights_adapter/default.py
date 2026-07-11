@@ -146,6 +146,11 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
 
             if is_glm_dsa_mtp:
                 mtp_idx = config.num_hidden_layers
+                # Native GLM MTP implements eh_proj as plain nn.Linear,
+                # so it cannot accept GGUF qweight/qweight_type parameters.
+                force_unquantized_modules.append(
+                    f"model.layers.{mtp_idx}.eh_proj"
+                )
                 gguf_to_hf_name_map.update(
                     {
                         f"blk.{mtp_idx}.nextn.eh_proj.weight": (
