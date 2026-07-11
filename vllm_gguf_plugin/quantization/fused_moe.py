@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from functools import partial
-import logging
-import os
 
 import torch
 
@@ -33,17 +31,6 @@ from .params import (
 )
 from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
 
-# Force our logger visible regardless of vLLM's dictConfig
-_moe_log = logging.getLogger("vllm_gguf_plugin.quantization.fused_moe")
-_gguf_log_level = os.environ.get("VLLM_GGUF_LOG_LEVEL", "INFO")
-_moe_log.setLevel(getattr(logging, _gguf_log_level.upper(), logging.INFO))
-if not _moe_log.handlers:
-    _moe_log.addHandler(logging.StreamHandler())
-    _moe_log.propagate = True
-
-_moe_call_count = 0
-_moe_log_interval = 50
-
 
 def _fused_moe_gguf(
     x: torch.Tensor,
@@ -55,13 +42,6 @@ def _fused_moe_gguf(
     qweight_type2: int,
     activation: str,
 ) -> torch.Tensor:
-    global _moe_call_count
-    _moe_call_count += 1
-    _should_log = (
-        _moe_call_count == 1
-        or _moe_call_count % _moe_log_interval == 0
-    )
-
     activation_enum = MoEActivation.from_str(activation)
 
     def act(inp: torch.Tensor):
@@ -79,12 +59,6 @@ def _fused_moe_gguf(
         and qweight_type in MMQ_QUANT_TYPES
         and x.shape[0] > 64
     ):
-        if _should_log:
-            _moe_log.info(
-                "MoE dispatch #%d: BRANCH=MMQ(batch) qweight_type=%d "
-                "qweight_type2=%d x.shape[0]=%d",
-                _moe_call_count, qweight_type, qweight_type2, x.shape[0],
-            )
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
@@ -121,12 +95,6 @@ def _fused_moe_gguf(
         )
         ops.moe_sum(out, out_hidden_states)
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
-        if _should_log:
-            _moe_log.info(
-                "MoE dispatch #%d: BRANCH=MMVQ(vec) qweight_type=%d "
-                "qweight_type2=%d x.shape[0]=%d",
-                _moe_call_count, qweight_type, qweight_type2, x.shape[0],
-            )
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
@@ -143,13 +111,6 @@ def _fused_moe_gguf(
         ops.moe_sum(out, out_hidden_states)
     else:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
-
-        if _should_log:
-            _moe_log.warning(
-                "MoE dispatch #%d: BRANCH=FALLBACK(slow) qweight_type=%d "
-                "qweight_type2=%d x.shape[0]=%d",
-                _moe_call_count, qweight_type, qweight_type2, x.shape[0],
-            )
 
         logger.warning_once(
             "There is no support for fast MoE kernel "

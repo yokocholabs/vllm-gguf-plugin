@@ -32,26 +32,10 @@ At DCP=1 the patched ``forward_mqa`` is behavior-identical to upstream:
 same index conversion call, ``seq_lens=None``, no LSE request.
 """
 
-import logging
-import os
-
 import torch
+from vllm.logger import init_logger
 
-logger = logging.getLogger(__name__)
-
-# vLLM's dictConfig only configures the "vllm" logger tree.
-# vllm_gguf_plugin is a separate top-level logger and inherits root
-# (WARNING by default). Force our level to INFO so our instrumentation
-# is visible without requiring VLLM_LOGGING_LEVEL=DEBUG.
-_gguf_log_level = os.environ.get("VLLM_GGUF_LOG_LEVEL", "INFO")
-logger.setLevel(getattr(logging, _gguf_log_level.upper(), logging.INFO))
-if not logger.handlers:
-    logger.addHandler(logging.StreamHandler())
-    logger.propagate = True
-
-# Throttle: log first call, then every Nth
-_fwd_mqa_call_count = 0
-_fwd_mqa_log_interval = 50
+logger = init_logger(__name__)
 
 
 def apply_sm120_dcp_patch() -> None:
@@ -88,13 +72,6 @@ def apply_sm120_dcp_patch() -> None:
         attn_metadata: FlashInferMLASparseMetadata,
         layer: AttentionLayer,
     ) -> "tuple[torch.Tensor, torch.Tensor | None]":
-        global _fwd_mqa_call_count
-        _fwd_mqa_call_count += 1
-        _should_log = (
-            _fwd_mqa_call_count == 1
-            or _fwd_mqa_call_count % _fwd_mqa_log_interval == 0
-        )
-
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
 
@@ -102,22 +79,6 @@ def apply_sm120_dcp_patch() -> None:
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
-
-        if _should_log:
-            logger.info(
-                "SM120 DCP forward_mqa call #%d: dcp_world_size=%d dcp_rank=%d "
-                "num_actual_toks=%d q.shape=%s topk_indices.shape=%s "
-                "num_heads=%s kv_lora_rank=%s need_lse=%s",
-                _fwd_mqa_call_count,
-                self.dcp_world_size,
-                self.dcp_rank,
-                num_actual_toks,
-                tuple(q.shape),
-                tuple(topk_indices.shape),
-                getattr(self, 'num_heads', '?'),
-                getattr(self, 'kv_lora_rank', '?'),
-                getattr(self, 'need_to_return_lse_for_decode', '?'),
-            )
 
         if self.dcp_world_size > 1:
             # Filter the logical top-k indices down to the entries this DCP
@@ -185,23 +146,6 @@ def apply_sm120_dcp_patch() -> None:
             empty_rows = (topk_indices_physical == -1).all(dim=-1)
             out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
             lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
-        else:
-            empty_rows = None
-
-        if _should_log:
-            n_empty = int(empty_rows.sum()) if empty_rows is not None else -1
-            logger.info(
-                "SM120 DCP forward_mqa call #%d: kernel_out type=%s "
-                "out.shape=%s lse=%s empty_rows=%d seq_lens=%s "
-                "topk_indices_physical.shape=%s",
-                _fwd_mqa_call_count,
-                type(kernel_out).__name__,
-                tuple(out.shape),
-                tuple(lse.shape) if lse is not None else None,
-                n_empty,
-                tuple(seq_lens[:4]) if seq_lens is not None else None,
-                tuple(topk_indices_physical.shape),
-            )
         return out, lse
 
     FlashInferMLASparseSM120Impl.forward_mqa = forward_mqa
