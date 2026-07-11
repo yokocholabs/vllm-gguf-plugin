@@ -380,6 +380,29 @@ def _mtp_indexer_model() -> torch.nn.Module:
     return model
 
 
+def test_gguf_filter_limits_mtp_draft_to_materialized_layer():
+    adapter = default_adapter_module.GGUFWeightsAdapter.__new__(
+        default_adapter_module.GGUFWeightsAdapter
+    )
+    adapter.load_spec = default_adapter_module.GGUFLoadSpec(
+        weights_source=[],
+        unquantized_modules=[],
+        gguf_to_hf_name_map={
+            "blk.0.weight": "model.layers.0.weight",
+            "blk.77.weight": "model.layers.77.weight",
+            "blk.78.weight": "model.layers.78.mtp_block.probe.weight",
+            "token_embd.weight": "model.embed_tokens.weight",
+        },
+    )
+
+    adapter.restrict_to_model(_mtp_indexer_model())
+
+    assert adapter.load_spec.gguf_to_hf_name_map == {
+        "blk.78.weight": "model.layers.78.mtp_block.probe.weight",
+        "token_embd.weight": "model.embed_tokens.weight",
+    }
+
+
 def test_indexer_loader_resolves_mtp_block():
     model = _mtp_indexer_model()
     mapped_name = "model.layers.78.self_attn.indexer.wk_weights_proj.weight"

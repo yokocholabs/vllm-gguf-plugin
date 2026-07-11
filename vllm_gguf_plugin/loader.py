@@ -78,6 +78,7 @@ class GGUFModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         adapter = self._prepare_adapter(model_config)
+        adapter.restrict_to_model(model)
         model.load_weights(adapter.prepare_weights(model_config))
 
     @staticmethod
@@ -195,8 +196,7 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
 
-            if vllm_config.parallel_config.pipeline_parallel_size > 1:
-                adapter.restrict_to_model(model)
+            adapter.restrict_to_model(model)
 
             # Stream weights through model.load_weights, collecting only
             # the small indexer tensors as a side effect.  Avoids

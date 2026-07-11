@@ -458,26 +458,40 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         return self.load_spec
 
     def restrict_to_model(self, model: torch.nn.Module) -> None:
-        """Drop mappings owned by another native vLLM pipeline stage.
+        """Restrict GGUF mappings to layers materialized by *model*.
 
-        vLLM materializes nonlocal modules as PPMissingLayer instances.
-        Filtering before the GGUF iterator touches tensor data prevents this
-        rank from dequantizing or transferring weights that vLLM will skip.
+        This applies to pipeline stages and reduced draft models such as MTP.
+        Filtering before the iterator touches tensor data prevents a draft
+        containing only one layer from paging the full GGUF checkpoint.
         """
         if self.load_spec is None:
             return
 
-        original = self.load_spec.gguf_to_hf_name_map
-        filtered = {
-            gguf_name: hf_name
-            for gguf_name, hf_name in original.items()
-            if not is_pp_missing_parameter(hf_name, model)
+        materialized_layers = {
+            int(match.group(1))
+            for name, _ in model.named_parameters()
+            if (match := _LAYER_NAME_RE.search(name)) is not None
         }
+        original = self.load_spec.gguf_to_hf_name_map
+        filtered: dict[str, str] = {}
+        for gguf_name, hf_name in original.items():
+            layer_match = _LAYER_NAME_RE.search(hf_name)
+            if (
+                layer_match is not None
+                and materialized_layers
+                and int(layer_match.group(1)) not in materialized_layers
+            ):
+                continue
+            if is_pp_missing_parameter(hf_name, model):
+                continue
+            filtered[gguf_name] = hf_name
+
         self.load_spec.gguf_to_hf_name_map = filtered
         logger.info(
-            "Pipeline-local GGUF map: retained %d/%d tensors",
+            "Model-local GGUF map: retained %d/%d tensors across %d layers",
             len(filtered),
             len(original),
+            len(materialized_layers),
         )
 
     def prepare_weights(
