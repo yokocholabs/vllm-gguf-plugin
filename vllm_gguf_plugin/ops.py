@@ -179,11 +179,32 @@ if (
 
 # --- Public API ---
 
+import logging as _logging
+import os as _os
+
+_ops_log = _logging.getLogger("vllm_gguf_plugin.ops")
+_gguf_log_level = _os.environ.get("VLLM_GGUF_LOG_LEVEL", "INFO")
+_ops_log.setLevel(getattr(_logging, _gguf_log_level.upper(), _logging.INFO))
+if not _ops_log.handlers:
+    _ops_log.addHandler(_logging.StreamHandler())
+    _ops_log.propagate = True
+
+_ops_call_count = 0
+_ops_log_interval = 50
+
 
 def ggml_dequantize(
     W: torch.Tensor, quant_type: int, m: int, n: int, dtype: torch.dtype | None
 ) -> torch.Tensor:
-    if _cuda_kernel_available("ggml_dequantize", quant_type):
+    global _ops_call_count
+    _ops_call_count += 1
+    use_cuda = _cuda_kernel_available("ggml_dequantize", quant_type)
+    if _ops_call_count == 1 or _ops_call_count % _ops_log_interval == 0:
+        _ops_log.info(
+            "ops dispatch #%d: ggml_dequantize quant_type=%d cuda=%s",
+            _ops_call_count, quant_type, use_cuda,
+        )
+    if use_cuda:
         return torch.ops._C_gguf.ggml_dequantize(W, quant_type, m, n, dtype)
     return ggml_dequantize_triton(W, quant_type, m, n, dtype)
 
@@ -255,7 +276,14 @@ def ggml_moe_a8_vec(
     row: int,
     tokens: int,
 ) -> torch.Tensor:
-    if _cuda_kernel_available("ggml_moe_a8_vec", quant_type):
+    use_cuda = _cuda_kernel_available("ggml_moe_a8_vec", quant_type)
+    if _ops_call_count == 1 or _ops_call_count % _ops_log_interval == 0:
+        _ops_log.info(
+            "ops dispatch: ggml_moe_a8_vec quant_type=%d cuda=%s "
+            "X.shape=%s W.shape=%s top_k=%d",
+            quant_type, use_cuda, tuple(X.shape), tuple(W.shape), top_k,
+        )
+    if use_cuda:
         return torch.ops._C_gguf.ggml_moe_a8_vec(
             X, W, topk_ids, top_k, quant_type, row, tokens
         )

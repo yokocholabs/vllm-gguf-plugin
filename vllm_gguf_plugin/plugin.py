@@ -109,6 +109,15 @@ def _register_omni_diffusion_quantization() -> None:
 
 def register() -> None:
     """Register the out-of-tree GGUF integration."""
+    import logging
+    import os
+    _log = logging.getLogger("vllm_gguf_plugin")
+    _gguf_log_level = os.environ.get("VLLM_GGUF_LOG_LEVEL", "INFO")
+    _log.setLevel(getattr(logging, _gguf_log_level.upper(), logging.INFO))
+    if not _log.handlers:
+        _log.addHandler(logging.StreamHandler())
+        _log.propagate = True
+    _log.info("GGUF plugin: register() start")
     register_quantization_config("gguf")(GGUFConfig)
     _register_omni_diffusion_quantization()
 
@@ -125,5 +134,7 @@ def register() -> None:
         register_config_parser("gguf")(GGUFConfigParser)
     _patch_engine_args()
     _patch_speculator_probe()
+    _log.info("GGUF plugin: applying SM120 DCP patch")
     apply_sm120_dcp_patch()
     _patch_diffusers_loader()
+    _log.info("GGUF plugin: register() complete")
