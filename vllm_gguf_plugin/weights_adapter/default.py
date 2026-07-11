@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from collections.abc import Iterable
@@ -51,6 +52,21 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         config = model_config.hf_config
         text_config = config.get_text_config()
         model_type = config.model_type
+        is_glm_dsa_mtp = model_type == "deepseek_mtp" and hasattr(
+            config, "index_topk"
+        )
+        name_map_block_count = text_config.num_hidden_layers
+        dummy_config = config
+        if is_glm_dsa_mtp:
+            name_map_block_count += config.num_nextn_predict_layers
+            dummy_config = copy.deepcopy(config)
+            dummy_config.update(
+                {
+                    "model_type": "glm_moe_dsa",
+                    "architectures": ["GlmMoeDsaForCausalLM"],
+                    "num_hidden_layers": name_map_block_count,
+                }
+            )
         is_multimodal = (
             hasattr(config, "vision_config") and config.vision_config is not None
         )
@@ -63,10 +79,10 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             model_type = "command-r"
         if model_type == "gemma3_text":
             model_type = "gemma3"
-        if model_type == "glm_moe_dsa":
+        if model_type == "glm_moe_dsa" or is_glm_dsa_mtp:
             model_type = "glm-dsa"
             first_moe_layer = getattr(config, "first_k_dense_replace", 0)
-            for idx in range(first_moe_layer, config.num_hidden_layers):
+            for idx in range(first_moe_layer, name_map_block_count):
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_inp.weight"] = (
                     f"model.layers.{idx}.mlp.gate.weight"
                 )
@@ -115,7 +131,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             # stacked_params_mapping (disable_tp=True creates [0] params
             # on TP>1).  Mark as force_unquantized so the iterator
             # dequantizes Q8_0 attn_k to fp32.
-            for idx in range(config.num_hidden_layers):
+            for idx in range(name_map_block_count):
                 gguf_to_hf_name_map[f"blk.{idx}.indexer.attn_k.weight"] = (
                     f"model.layers.{idx}.self_attn.indexer.wk_weights_proj.weight"
                 )
@@ -131,7 +147,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             # (kv_b_proj) and coalesce in prepare_weights.  Mark as
             # force_unquantized so the iterator dequantizes both Q8_0
             # shards to fp32 before concatenation.
-            for idx in range(config.num_hidden_layers):
+            for idx in range(name_map_block_count):
                 gguf_to_hf_name_map[f"blk.{idx}.attn_k_b.weight"] = (
                     f"model.layers.{idx}.self_attn.kv_b_proj.weight"
                 )
@@ -139,6 +155,25 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                     f"model.layers.{idx}.self_attn.kv_b_proj.weight"
                 )
             force_unquantized_modules.append("self_attn.kv_b_proj")
+
+            if is_glm_dsa_mtp:
+                mtp_idx = config.num_hidden_layers
+                gguf_to_hf_name_map.update(
+                    {
+                        f"blk.{mtp_idx}.nextn.eh_proj.weight": (
+                            f"model.layers.{mtp_idx}.eh_proj.weight"
+                        ),
+                        f"blk.{mtp_idx}.nextn.enorm.weight": (
+                            f"model.layers.{mtp_idx}.enorm.weight"
+                        ),
+                        f"blk.{mtp_idx}.nextn.hnorm.weight": (
+                            f"model.layers.{mtp_idx}.hnorm.weight"
+                        ),
+                        f"blk.{mtp_idx}.nextn.shared_head_norm.weight": (
+                            f"model.layers.{mtp_idx}.shared_head.norm.weight"
+                        ),
+                    }
+                )
 
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
@@ -232,7 +267,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
 
-        text_name_map = gguf.get_tensor_name_map(arch, text_config.num_hidden_layers)
+        text_name_map = gguf.get_tensor_name_map(arch, name_map_block_count)
 
         if is_multimodal:
             mm_proj_arch = gguf.MODEL_ARCH.MMPROJ
@@ -244,7 +279,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
 
         with torch.device("meta"):
             dummy_model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=model_config.trust_remote_code
+                dummy_config, trust_remote_code=model_config.trust_remote_code
             )
 
         state_dict = dummy_model.state_dict()
