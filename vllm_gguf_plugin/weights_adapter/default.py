@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import os
 import re
 from collections.abc import Iterable
@@ -56,17 +55,6 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             config, "index_topk"
         )
         name_map_block_count = text_config.num_hidden_layers
-        dummy_config = config
-        if is_glm_dsa_mtp:
-            name_map_block_count += config.num_nextn_predict_layers
-            dummy_config = copy.deepcopy(config)
-            dummy_config.update(
-                {
-                    "model_type": "glm_moe_dsa",
-                    "architectures": ["GlmMoeDsaForCausalLM"],
-                    "num_hidden_layers": name_map_block_count,
-                }
-            )
         is_multimodal = (
             hasattr(config, "vision_config") and config.vision_config is not None
         )
@@ -279,7 +267,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
 
         with torch.device("meta"):
             dummy_model = AutoModelForCausalLM.from_config(
-                dummy_config, trust_remote_code=model_config.trust_remote_code
+                config, trust_remote_code=model_config.trust_remote_code
             )
 
         state_dict = dummy_model.state_dict()
@@ -337,6 +325,25 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
             elif hf_name not in gguf_to_hf_name_map.values():
                 unmapped_params.append(hf_name)
+
+        if is_glm_dsa_mtp:
+            source_idx = config.num_hidden_layers - 1
+            mtp_idx = config.num_hidden_layers
+            source_gguf_prefix = f"blk.{source_idx}."
+            source_hf_prefix = f"model.layers.{source_idx}."
+            for gguf_name, hf_name in list(gguf_to_hf_name_map.items()):
+                if gguf_name.startswith(source_gguf_prefix) and (
+                    source_hf_prefix in hf_name
+                ):
+                    mtp_gguf_name = gguf_name.replace(
+                        source_gguf_prefix, f"blk.{mtp_idx}.", 1
+                    )
+                    gguf_to_hf_name_map.setdefault(
+                        mtp_gguf_name,
+                        hf_name.replace(
+                            source_hf_prefix, f"model.layers.{mtp_idx}.", 1
+                        ),
+                    )
 
         if unmapped_params:
             unmapped_params = [
