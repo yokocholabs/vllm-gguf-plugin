@@ -493,7 +493,7 @@ def test_streaming_dequantize_bounds_device_temporaries(monkeypatch):
     monkeypatch.setattr(
         weight_utils_module,
         "_GGUF_STREAM_CHUNK_BYTES",
-        8,
+        16,
     )
 
     result = weight_utils_module._streaming_ggml_dequantize(
