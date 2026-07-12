@@ -51,9 +51,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         config = model_config.hf_config
         text_config = config.get_text_config()
         model_type = config.model_type
-        is_glm_dsa_mtp = model_type == "deepseek_mtp" and hasattr(
-            config, "index_topk"
-        )
+        is_glm_dsa_mtp = model_type == "deepseek_mtp" and hasattr(config, "index_topk")
         name_map_block_count = text_config.num_hidden_layers
         is_multimodal = (
             hasattr(config, "vision_config") and config.vision_config is not None
@@ -148,9 +146,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 mtp_idx = config.num_hidden_layers
                 # Native GLM MTP implements eh_proj as plain nn.Linear,
                 # so it cannot accept GGUF qweight/qweight_type parameters.
-                force_unquantized_modules.append(
-                    f"model.layers.{mtp_idx}.eh_proj"
-                )
+                force_unquantized_modules.append(f"model.layers.{mtp_idx}.eh_proj")
                 gguf_to_hf_name_map.update(
                     {
                         f"blk.{mtp_idx}.nextn.eh_proj.weight": (
@@ -450,7 +446,8 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         )
         # Log indexer-specific mappings for debugging
         indexer_maps = {
-            k: v for k, v in gguf_to_hf_name_map.items()
+            k: v
+            for k, v in gguf_to_hf_name_map.items()
             if "indexer" in k or "indexer" in v
         }
         if indexer_maps:
@@ -513,13 +510,6 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             }
         )
         reported_layers: set[int] = set()
-        # Only kv_b_proj needs pairing (attn_k_b + attn_v_b map to the
-        # same name but are NOT adjacent in GGUF ordering — 7 tensors
-        # separate them).  Indexer wk_weights_proj shards are handled by
-        # the loader intercept (_load_indexer_weights coalesces them).
-        # Everything else streams directly to avoid accumulating the
-        # full model in RAM.
-        kv_b_held: tuple[str, torch.Tensor] | None = None
         for name, tensor in mapped:
             layer_match = _LAYER_NAME_RE.search(name)
             if layer_match is not None:
@@ -535,51 +525,8 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             if "indexer" in name or "kv_b_proj" in name:
                 logger.debug(
                     "GGUF weight: %s shape=%s dtype=%s",
-                    name, tensor.shape, tensor.dtype,
+                    name,
+                    tensor.shape,
+                    tensor.dtype,
                 )
-            if "kv_b_proj.weight" in name:
-                if kv_b_held is not None:
-                    # Second shard arrived — fuse with the held one.
-                    # GGUF stores per-head 3D tensors:
-                    #   attn_k_b = W_UK^T: [n_head, kv_lora, qk_nope]
-                    #   attn_v_b = W_UV:   [n_head, v_head, kv_lora]
-                    # vLLM MLA requires HF kv_b_proj layout — rows
-                    # interleaved PER HEAD as [K_h(qk_nope); V_h(v_head)]:
-                    # process_weights_after_loading does
-                    # .T.view(kv_lora, n_head, qk_nope+v).split(...).
-                    # A block cat ([all K; all V]) has the right shape but
-                    # scrambles heads (and TP sharding).
-                    a = kv_b_held[1]
-                    b = tensor
-                    if a.dim() == 3 and b.dim() == 3:
-                        if a.shape[1] == b.shape[2]:
-                            k3, v3 = a, b
-                        else:
-                            k3, v3 = b, a
-                        # [n_head, qk_nope, kv_lora]
-                        k3 = k3.transpose(1, 2)
-                        # [n_head, qk_nope + v_head, kv_lora]
-                        fused = torch.cat([k3, v3], dim=1)
-                        logger.debug(
-                            "Coalescing %s per-head: K=%s V=%s -> %s",
-                            name, k3.shape, v3.shape, fused.shape,
-                        )
-                        yield name, fused.reshape(-1, fused.shape[-1])
-                    else:
-                        logger.debug(
-                            "Coalescing %s: cat([%s, %s], dim=0)",
-                            name, a.shape, b.shape,
-                        )
-                        yield name, torch.cat([a, b], dim=0)
-                    kv_b_held = None
-                else:
-                    # First shard (K) — hold until V arrives.
-                    kv_b_held = (name, tensor)
-            else:
-                # All other weights (including indexer wk_weights_proj
-                # shards) stream directly.  The loader intercepts
-                # indexer weights and coalesces them there.
-                yield name, tensor
-        # Flush any remaining held kv_b_proj (shouldn't happen).
-        if kv_b_held is not None:
-            yield kv_b_held[0], kv_b_held[1]
+            yield name, tensor

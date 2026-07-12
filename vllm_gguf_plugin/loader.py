@@ -109,31 +109,13 @@ class GGUFModelLoader(BaseModelLoader):
     def _load_indexer_weights(
         model: nn.Module, indexer_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
-        """Load pre-fused indexer weights directly into model params.
-
-        Coalesce same-name tensors (attn_k + proj both map to
-        wk_weights_proj.weight) here — the prepare_weights coalescing
-        breaks when other indexer weights (wq_b, k_norm) are interspersed
-        between the two shards in the GGUF ordering.
-        """
-        # Group by name and coalesce (cat dim=0).
-        by_name: dict[str, torch.Tensor] = {}
+        """Load fused indexer shards directly without a concatenation buffer."""
+        by_name: dict[str, list[torch.Tensor]] = {}
         for name, tensor in indexer_weights:
-            if name in by_name:
-                logger.debug(
-                    "Coalescing indexer shards for %s: cat([%s, %s], dim=0)",
-                    name,
-                    by_name[name].shape,
-                    tensor.shape,
-                )
-                by_name[name] = torch.cat([by_name[name], tensor], dim=0)
-            else:
-                by_name[name] = tensor
+            by_name.setdefault(name, []).append(tensor)
 
         params_dict = dict(model.named_parameters())
-        for name, tensor in by_name.items():
-            # Try the mapped name, its model-prefix variant, and the
-            # MTP decoder-block location used after DeepSeekMTP rewrites.
+        for name, tensors in by_name.items():
             candidates = [name]
             if name.startswith("model."):
                 candidates.append(name[len("model.") :])
@@ -142,7 +124,25 @@ class GGUFModelLoader(BaseModelLoader):
             for candidate in tuple(candidates):
                 if ".self_attn." in candidate:
                     candidates.append(
-                        candidate.replace(".self_attn.", ".mtp_block.self_attn.", 1)
+                        candidate.replace(
+                            ".self_attn.",
+                            ".self_attn.mla_attn.",
+                            1,
+                        )
+                    )
+                    candidates.append(
+                        candidate.replace(
+                            ".self_attn.",
+                            ".mtp_block.self_attn.",
+                            1,
+                        )
+                    )
+                    candidates.append(
+                        candidate.replace(
+                            ".self_attn.",
+                            ".mtp_block.self_attn.mla_attn.",
+                            1,
+                        )
                     )
 
             param_name = next(
@@ -166,17 +166,107 @@ class GGUFModelLoader(BaseModelLoader):
                     name,
                 )
                 continue
+
             param = params_dict[param_name]
-            # Direct copy — bypasses weight_loader_v2 which would try to
-            # re-shard an already-fused tensor.  disable_tp=True means
-            # the param is full-size and replicated on all ranks.
-            if param.data.shape != tensor.shape:
+            expected_shape = list(param.data.shape)
+            if not expected_shape:
+                raise ValueError(f"Indexer weight {name} cannot target a scalar")
+            expected_rows = sum(tensor.shape[0] for tensor in tensors)
+            if expected_rows != expected_shape[0] or any(
+                tensor.shape[1:] != param.data.shape[1:] for tensor in tensors
+            ):
                 raise ValueError(
                     f"Indexer weight {name} shape mismatch: "
-                    f"param={param.data.shape} tensor={tensor.shape}"
+                    f"param={param.data.shape} "
+                    f"shards={[tensor.shape for tensor in tensors]}"
                 )
-            param.data.copy_(tensor)
-            logger.debug("Loaded indexer weight %s shape=%s", name, tensor.shape)
+
+            row_offset = 0
+            for tensor in tensors:
+                rows = tensor.shape[0]
+                param.data.narrow(0, row_offset, rows).copy_(tensor)
+                row_offset += rows
+            logger.debug(
+                "Stream-loaded indexer weight %s from %d shards shape=%s",
+                name,
+                len(tensors),
+                param.data.shape,
+            )
+
+    @staticmethod
+    def _load_kv_b_weights(
+        model: nn.Module,
+        name: str,
+        first: torch.Tensor,
+        second: torch.Tensor,
+    ) -> None:
+        """Load rank-local GLM K/V shards directly into fused kv_b_proj."""
+        if first.ndim != 3 or second.ndim != 3:
+            raise ValueError(
+                f"GLM kv_b_proj shards must be 3D: {first.shape} and {second.shape}"
+            )
+        if first.shape[1] == second.shape[2]:
+            k3, v3 = first, second
+        elif second.shape[1] == first.shape[2]:
+            k3, v3 = second, first
+        else:
+            raise ValueError(
+                f"Cannot identify GLM kv_b_proj K/V shards: "
+                f"{first.shape} and {second.shape}"
+            )
+
+        candidates = [name]
+        if name.startswith("model."):
+            candidates.append(name[len("model.") :])
+        else:
+            candidates.append("model." + name)
+        for candidate in tuple(candidates):
+            if ".self_attn." in candidate:
+                candidates.append(
+                    candidate.replace(
+                        ".self_attn.",
+                        ".mtp_block.self_attn.",
+                        1,
+                    )
+                )
+
+        params_dict = dict(model.named_parameters())
+        param_name = next(
+            (candidate for candidate in candidates if candidate in params_dict),
+            None,
+        )
+        if param_name is None:
+            raise ValueError(f"GLM kv_b_proj weight {name} not found in model params")
+
+        param = params_dict[param_name]
+        num_heads, kv_lora_rank, qk_nope_dim = k3.shape
+        if v3.shape[0] != num_heads or v3.shape[2] != kv_lora_rank:
+            raise ValueError(
+                f"GLM kv_b_proj shard shape mismatch: K={k3.shape} V={v3.shape}"
+            )
+        value_head_dim = v3.shape[1]
+        expected_shape = (
+            num_heads * (qk_nope_dim + value_head_dim),
+            kv_lora_rank,
+        )
+        if tuple(param.data.shape) != expected_shape:
+            raise ValueError(
+                f"GLM kv_b_proj parameter shape mismatch: "
+                f"param={param.data.shape} expected={expected_shape}"
+            )
+
+        destination = param.data.view(
+            num_heads,
+            qk_nope_dim + value_head_dim,
+            kv_lora_rank,
+        )
+        destination[:, :qk_nope_dim, :].copy_(k3.transpose(1, 2))
+        destination[:, qk_nope_dim:, :].copy_(v3)
+        logger.debug(
+            "Stream-loaded rank-local GLM kv_b_proj %s shape=%s",
+            name,
+            param.data.shape,
+        )
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -200,31 +290,49 @@ class GGUFModelLoader(BaseModelLoader):
             adapter.restrict_to_model(model)
 
             pending_indexer: dict[str, torch.Tensor] = {}
+            pending_kv_b: dict[str, torch.Tensor] = {}
             loaded_indexer_tensors = 0
+            loaded_kv_b_tensors = 0
             peak_pending_indexers = 0
+            peak_pending_kv_b = 0
 
             def _filtered(
                 weights: Iterable[tuple[str, torch.Tensor]],
             ) -> Iterable[tuple[str, torch.Tensor]]:
-                nonlocal loaded_indexer_tensors, peak_pending_indexers
+                nonlocal pending_indexer, pending_kv_b
+                nonlocal loaded_indexer_tensors, loaded_kv_b_tensors
+                nonlocal peak_pending_indexers, peak_pending_kv_b
                 for name, tensor in weights:
-                    if ".indexer.wk_weights_proj" not in name:
-                        yield name, tensor
-                        continue
-
-                    first = pending_indexer.pop(name, None)
-                    if first is None:
-                        pending_indexer[name] = tensor
-                        peak_pending_indexers = max(
-                            peak_pending_indexers, len(pending_indexer)
+                    if ".indexer.wk_weights_proj" in name:
+                        first = pending_indexer.pop(name, None)
+                        if first is None:
+                            pending_indexer[name] = tensor
+                            peak_pending_indexers = max(
+                                peak_pending_indexers,
+                                len(pending_indexer),
+                            )
+                            continue
+                        self._load_indexer_weights(
+                            model,
+                            [(name, first), (name, tensor)],
                         )
+                        loaded_indexer_tensors += 2
                         continue
 
-                    self._load_indexer_weights(
-                        model,
-                        [(name, first), (name, tensor)],
-                    )
-                    loaded_indexer_tensors += 2
+                    if ".self_attn.kv_b_proj.weight" in name:
+                        first = pending_kv_b.pop(name, None)
+                        if first is None:
+                            pending_kv_b[name] = tensor
+                            peak_pending_kv_b = max(
+                                peak_pending_kv_b,
+                                len(pending_kv_b),
+                            )
+                            continue
+                        self._load_kv_b_weights(model, name, first, tensor)
+                        loaded_kv_b_tensors += 2
+                        continue
+
+                    yield name, tensor
 
             model.load_weights(_filtered(adapter.prepare_weights(model_config)))
 
@@ -234,13 +342,22 @@ class GGUFModelLoader(BaseModelLoader):
                 loaded_indexer_tensors += len(remaining)
                 pending_indexer.clear()
 
+            if pending_kv_b:
+                raise ValueError(
+                    f"Missing GLM kv_b_proj shard pairs: {sorted(pending_kv_b)}"
+                )
+
             logger.info(
-                "Stream-loaded %d indexer tensors with at most %d pending pairs",
+                "Stream-loaded %d indexer tensors and %d rank-local "
+                "kv_b_proj tensors; peak pending pairs indexer=%d kv_b=%d",
                 loaded_indexer_tensors,
+                loaded_kv_b_tensors,
                 peak_pending_indexers,
+                peak_pending_kv_b,
             )
             process_weights_after_loading(model, model_config, target_device)
             del pending_indexer
+            del pending_kv_b
             gc.collect()
             torch.accelerator.empty_cache()
             logger.info(

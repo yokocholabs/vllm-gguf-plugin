@@ -424,12 +424,22 @@ def test_gguf_iterator_streams_from_mmap_and_releases_shard_cache(monkeypatch):
         def __init__(self, _path):
             self.tensors = [FakeTensor()]
 
-    released = []
+    cache_events = []
     monkeypatch.setattr(weight_utils_module.gguf, "GGUFReader", FakeReader)
     monkeypatch.setattr(
         weight_utils_module,
-        "_drop_gguf_file_cache",
-        released.append,
+        "_open_gguf_file_cache_fd",
+        lambda path: 41,
+    )
+    monkeypatch.setattr(
+        weight_utils_module,
+        "_evict_gguf_file_cache",
+        lambda fd: cache_events.append(("evict", fd)),
+    )
+    monkeypatch.setattr(
+        weight_utils_module.os,
+        "close",
+        lambda fd: cache_events.append(("close", fd)),
     )
 
     weights = list(
@@ -442,7 +452,11 @@ def test_gguf_iterator_streams_from_mmap_and_releases_shard_cache(monkeypatch):
     assert len(weights) == 1
     _, loaded = weights[0]
     assert loaded.data_ptr() == data.__array_interface__["data"][0]
-    assert released == ["model-00001.gguf"]
+    assert cache_events == [
+        ("evict", 41),
+        ("evict", 41),
+        ("close", 41),
+    ]
 
 
 def test_streaming_copy_uses_bounded_mmap_windows():
@@ -459,6 +473,39 @@ def test_streaming_copy_uses_bounded_mmap_windows():
 
     assert torch.equal(destination, source)
     assert len(releases) == 4
+
+
+def test_streaming_dequantize_bounds_device_temporaries(monkeypatch):
+    import vllm_gguf_plugin.ops as ops_module
+
+    raw = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
+    releases = []
+    raw._gguf_mmap_release = lambda: releases.append(True)
+    chunk_rows = []
+
+    def fake_dequantize(packed, weight_type, rows, cols, dtype):
+        del weight_type, cols
+        chunk_rows.append(rows)
+        return packed.to(dtype)
+
+    monkeypatch.setattr(ops_module, "ggml_dequantize", fake_dequantize)
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    monkeypatch.setattr(
+        weight_utils_module,
+        "_GGUF_STREAM_CHUNK_BYTES",
+        8,
+    )
+
+    result = weight_utils_module._streaming_ggml_dequantize(
+        raw,
+        object(),
+        block_size=1,
+        type_size=1,
+    )
+
+    assert torch.equal(result, raw.to(torch.bfloat16))
+    assert chunk_rows == [2, 2]
+    assert len(releases) == 2
 
 
 def test_indexer_loader_resolves_mtp_block():
@@ -503,3 +550,73 @@ def test_indexer_loader_rejects_missing_mtp_parameter():
             model,
             [(mapped_name, torch.ones((3, 4)))],
         )
+
+
+def test_glm_kv_b_raw_is_sharded_before_dequantization(monkeypatch):
+    raw = torch.arange(4 * 3 * 2).reshape(4, 3, 2)
+    releases = []
+    raw._gguf_mmap_release = lambda: releases.append(True)
+    monkeypatch.setattr(
+        weight_utils_module,
+        "get_tensor_model_parallel_rank",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        weight_utils_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
+
+    local, sharded = weight_utils_module._tp_shard_glm_kv_b_raw(
+        "model.layers.0.self_attn.kv_b_proj.weight",
+        raw,
+    )
+
+    assert sharded is True
+    assert torch.equal(local, raw[2:])
+    assert local._gguf_mmap_release is raw._gguf_mmap_release
+
+
+def test_kv_b_loader_writes_fused_parameter_without_cat_buffer():
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleDict({"0": torch.nn.Module()})
+    layer = model.model.layers["0"]
+    layer.self_attn = torch.nn.Module()
+    layer.self_attn.kv_b_proj = torch.nn.Linear(3, 10, bias=False)
+
+    k3 = torch.arange(2 * 3 * 3, dtype=torch.float32).reshape(2, 3, 3)
+    v3 = torch.arange(2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 3)
+    name = "model.layers.0.self_attn.kv_b_proj.weight"
+
+    GGUFModelLoader._load_kv_b_weights(model, name, k3, v3)
+
+    expected = torch.cat([k3.transpose(1, 2), v3], dim=1).reshape(10, 3)
+    assert torch.equal(layer.self_attn.kv_b_proj.weight, expected)
+
+
+def test_indexer_loader_resolves_mla_attention_path():
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleDict({"0": torch.nn.Module()})
+    layer = model.model.layers["0"]
+    layer.self_attn = torch.nn.Module()
+    layer.self_attn.mla_attn = torch.nn.Module()
+    layer.self_attn.mla_attn.indexer = torch.nn.Module()
+    layer.self_attn.mla_attn.indexer.wk_weights_proj = torch.nn.Linear(
+        4,
+        3,
+        bias=False,
+    )
+    name = "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
+    wk = torch.ones((2, 4))
+    weights_proj = 2 * torch.ones((1, 4))
+
+    GGUFModelLoader._load_indexer_weights(
+        model,
+        [(name, wk), (name, weights_proj)],
+    )
+
+    actual = layer.self_attn.mla_attn.indexer.wk_weights_proj.weight
+    assert torch.equal(actual[:2], wk)
+    assert torch.equal(actual[2:], weights_proj)

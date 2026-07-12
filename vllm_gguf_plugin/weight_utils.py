@@ -12,6 +12,10 @@ import gguf
 import numpy as np
 import torch
 from huggingface_hub import snapshot_download
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -133,6 +137,39 @@ def _inherit_mmap_release(
     return view
 
 
+def _tp_shard_glm_kv_b_raw(
+    name: str,
+    raw: torch.Tensor,
+) -> tuple[torch.Tensor, bool]:
+    if "self_attn.kv_b_proj" not in name or raw.dim() != 3:
+        return raw, False
+
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+    if raw.shape[0] % tp_size != 0:
+        raise ValueError(
+            "GLM kv_b_proj head count must divide evenly across TP ranks: "
+            f"{raw.shape[0]} vs {tp_size}"
+        )
+    heads_per_rank = raw.shape[0] // tp_size
+    local_raw = _inherit_mmap_release(
+        raw,
+        raw.narrow(
+            0,
+            tp_rank * heads_per_rank,
+            heads_per_rank,
+        ),
+    )
+    logger.info(
+        "Dequantizing rank-local GLM kv_b_proj shard: %s rank=%d/%d heads=%d",
+        name,
+        tp_rank,
+        tp_size,
+        heads_per_rank,
+    )
+    return local_raw, tp_size > 1
+
+
 def streaming_copy_(
     destination: torch.Tensor,
     source: torch.Tensor,
@@ -150,9 +187,7 @@ def streaming_copy_(
     rows_per_chunk = max(1, chunk_bytes // max(row_span_bytes, 1))
     for start in range(0, source.shape[0], rows_per_chunk):
         rows = min(rows_per_chunk, source.shape[0] - start)
-        destination.narrow(0, start, rows).copy_(
-            source.narrow(0, start, rows)
-        )
+        destination.narrow(0, start, rows).copy_(source.narrow(0, start, rows))
         release()
     return destination
 
@@ -171,6 +206,48 @@ def streaming_to_device(
     return streaming_copy_(destination, source)
 
 
+def _streaming_ggml_dequantize(
+    raw: torch.Tensor,
+    weight_type: object,
+    block_size: int,
+    type_size: int,
+) -> torch.Tensor:
+    """Dequantize GGUF rows with bounded packed and BF16 device temporaries."""
+    from vllm_gguf_plugin.ops import ggml_dequantize
+
+    leading = raw.shape[:-1]
+    packed_cols = raw.shape[-1]
+    raw_2d = raw.reshape(-1, packed_cols)
+    rows = raw_2d.shape[0]
+    cols = packed_cols // type_size * block_size
+    destination = torch.empty((rows, cols), dtype=torch.bfloat16, device="cpu")
+    packed_row_bytes = packed_cols * raw.element_size()
+    dequantized_row_bytes = cols * destination.element_size()
+    rows_per_chunk = max(
+        1,
+        _GGUF_STREAM_CHUNK_BYTES // max(packed_row_bytes, dequantized_row_bytes),
+    )
+    release = getattr(raw, "_gguf_mmap_release", None)
+
+    for start in range(0, rows, rows_per_chunk):
+        chunk_rows = min(rows_per_chunk, rows - start)
+        packed_chunk = raw_2d.narrow(0, start, chunk_rows).cuda()
+        dequantized_chunk = ggml_dequantize(
+            packed_chunk,
+            weight_type,
+            chunk_rows,
+            cols,
+            torch.bfloat16,
+        )
+        destination.narrow(0, start, chunk_rows).copy_(dequantized_chunk)
+        del dequantized_chunk
+        del packed_chunk
+        if release is not None:
+            release()
+
+    return destination.reshape(*leading, cols)
+
+
 def _advise_gguf_mmap(reader: object, advice: int | None) -> None:
     """Apply mmap advice to the GGUF reader when its mapping is exposed."""
     if advice is None:
@@ -186,19 +263,37 @@ def _advise_gguf_mmap(reader: object, advice: int | None) -> None:
         logger.debug("Could not apply mmap advice to GGUF shard", exc_info=True)
 
 
+def _open_gguf_file_cache_fd(path: str) -> int | None:
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        return None
+    try:
+        return os.open(path, os.O_RDONLY)
+    except OSError:
+        logger.debug(
+            "Could not open GGUF shard for cache eviction: %s",
+            path,
+            exc_info=True,
+        )
+        return None
+
+
+def _evict_gguf_file_cache(fd: int) -> None:
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        logger.debug("Could not evict GGUF shard file cache", exc_info=True)
+
+
 def _drop_gguf_file_cache(path: str) -> None:
     """Release completed GGUF shard pages from the Linux filesystem cache."""
-    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+    fd = _open_gguf_file_cache_fd(path)
+    if fd is None:
         return
     try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-        logger.info("Released GGUF shard file cache: %s", os.path.basename(path))
-    except OSError:
-        logger.debug("Could not release GGUF shard file cache: %s", path, exc_info=True)
+        _evict_gguf_file_cache(fd)
+    finally:
+        os.close(fd)
+    logger.info("Released GGUF shard file cache: %s", os.path.basename(path))
 
 
 def gguf_quant_weights_iterator_multi(
@@ -223,9 +318,19 @@ def gguf_quant_weights_iterator_multi(
     for gguf_file in gguf_files:
         reader = gguf.GGUFReader(gguf_file)
         _advise_gguf_mmap(reader, getattr(mmap, "MADV_SEQUENTIAL", None))
-        release_pages = lambda: _advise_gguf_mmap(
-            reader, getattr(mmap, "MADV_DONTNEED", None)
-        )
+        cache_fd = _open_gguf_file_cache_fd(gguf_file)
+
+        def release_pages(
+            reader: object = reader,
+            cache_fd: int | None = cache_fd,
+        ) -> None:
+            _advise_gguf_mmap(
+                reader,
+                getattr(mmap, "MADV_DONTNEED", None),
+            )
+            if cache_fd is not None:
+                _evict_gguf_file_cache(cache_fd)
+
         try:
             for tensor in reader.tensors:
                 if gguf_to_hf_name_map is not None:
@@ -257,34 +362,17 @@ def gguf_quant_weights_iterator_multi(
                 if is_unquant_module:
                     from gguf import GGML_QUANT_SIZES
 
-                    from vllm_gguf_plugin.ops import ggml_dequantize
-
                     block_size, type_size = GGML_QUANT_SIZES[weight_type]
                     raw = _mmap_tensor(tensor.data, release_pages)
-                    if raw.dim() > 2:
-                        leading = raw.shape[:-1]
-                        packed_cols = raw.shape[-1]
-                        raw_2d = raw.reshape(-1, packed_cols)
-                        rows = raw_2d.shape[0]
-                        cols = packed_cols // type_size * block_size
-                        dequant_2d = ggml_dequantize(
-                            raw_2d.cuda(),
-                            weight_type,
-                            rows,
-                            cols,
-                            torch.bfloat16,
-                        ).cpu()
-                        param = dequant_2d.reshape(*leading, cols)
-                    else:
-                        rows = raw.shape[0] if raw.dim() > 1 else 1
-                        cols = raw.shape[-1] // type_size * block_size
-                        param = ggml_dequantize(
-                            raw.cuda(),
-                            weight_type,
-                            rows,
-                            cols,
-                            torch.bfloat16,
-                        ).cpu()
+                    raw, tp_sharded = _tp_shard_glm_kv_b_raw(name, raw)
+                    param = _streaming_ggml_dequantize(
+                        raw,
+                        weight_type,
+                        block_size,
+                        type_size,
+                    )
+                    if tp_sharded:
+                        param._vllm_tp_sharded = True
                     logger.debug(
                         "Dequantized %s: %s -> bf16 %s",
                         name,
@@ -297,8 +385,9 @@ def gguf_quant_weights_iterator_multi(
                     continue
 
                 if weight_type.name not in _QUANT_TYPES:
-                    yield name.replace("weight", "qweight_type"), torch.tensor(
-                        weight_type
+                    yield (
+                        name.replace("weight", "qweight_type"),
+                        torch.tensor(weight_type),
                     )
                     name = name.replace("weight", "qweight")
 
@@ -308,9 +397,7 @@ def gguf_quant_weights_iterator_multi(
                     if reader.byte_order == "S":
                         weight = weight.byteswap()
                     mapped = _mmap_tensor(weight, release_pages)
-                    param = _inherit_mmap_release(
-                        mapped, mapped.view(torch.bfloat16)
-                    )
+                    param = _inherit_mmap_release(mapped, mapped.view(torch.bfloat16))
                 else:
                     param = _mmap_tensor(weight, release_pages)
                 yield name, param
@@ -318,8 +405,14 @@ def gguf_quant_weights_iterator_multi(
                 del param
         finally:
             _advise_gguf_mmap(reader, getattr(mmap, "MADV_DONTNEED", None))
+            if cache_fd is not None:
+                _evict_gguf_file_cache(cache_fd)
+                os.close(cache_fd)
+                logger.info(
+                    "Released GGUF shard file cache: %s",
+                    os.path.basename(gguf_file),
+                )
             del reader
-            _drop_gguf_file_cache(gguf_file)
 
 
 def get_gguf_unquantized_params(gguf_files: list[str]) -> list[str]:
