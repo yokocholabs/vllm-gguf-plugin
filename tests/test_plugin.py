@@ -445,6 +445,22 @@ def test_gguf_iterator_streams_from_mmap_and_releases_shard_cache(monkeypatch):
     assert released == ["model-00001.gguf"]
 
 
+def test_streaming_copy_uses_bounded_mmap_windows():
+    source = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    destination = torch.empty_like(source)
+    releases = []
+    source._gguf_mmap_release = lambda: releases.append(True)
+
+    weight_utils_module.streaming_copy_(
+        destination,
+        source,
+        chunk_bytes=source.stride(0) * source.element_size() * 2,
+    )
+
+    assert torch.equal(destination, source)
+    assert len(releases) == 4
+
+
 def test_indexer_loader_resolves_mtp_block():
     model = _mtp_indexer_model()
     mapped_name = "model.layers.78.self_attn.indexer.wk_weights_proj.weight"

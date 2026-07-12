@@ -12,13 +12,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.parameter import BasevLLMParameter
 
 
+from ..weight_utils import (
+    _inherit_mmap_release,
+    streaming_copy_,
+    streaming_to_device,
+)
+
+
 def _clone_loaded_weight(
     loaded_weight: torch.Tensor, device: torch.device
 ) -> torch.Tensor:
-    """Copy a possibly mmap-backed TP view directly to its destination."""
-    if len(loaded_weight.shape) == 0:
-        loaded_weight = loaded_weight.reshape(1)
-    return loaded_weight.detach().to(device=device, copy=True)
+    """Stream a possibly mmap-backed TP view directly to its destination."""
+    return streaming_to_device(loaded_weight, device)
 
 
 def _resolve_gguf_weight_loader(
@@ -90,14 +95,19 @@ def _store_gguf_loaded_weight(
     loaded_weight: torch.Tensor,
     shard_id: int | str | None = None,
 ) -> None:
-    loaded_weight = _clone_loaded_weight(loaded_weight, param.device)
+    if loaded_weight.ndim == 0:
+        loaded_weight = _inherit_mmap_release(
+            loaded_weight, loaded_weight.reshape(1)
+        )
+
     if shard_id is None:
         _materialize_parameter_data(
             param, tuple(loaded_weight.shape), loaded_weight.dtype
         )
-        param.data.copy_(loaded_weight)
+        streaming_copy_(param.data, loaded_weight)
         return
 
+    loaded_weight = streaming_to_device(loaded_weight, param.device)
     if shard_id not in param.shard_id_map:
         param.shard_id_map[shard_id] = len(param.data_container)
         param.data_container.append(loaded_weight)
@@ -146,16 +156,19 @@ def _gguf_embedding_weight_loader(
 ) -> None:
     start_idx = layer.shard_indices.org_vocab_start_index
     shard_size = layer.shard_indices.org_vocab_end_index - start_idx
-    loaded_weight = loaded_weight.narrow(param.output_dim, start_idx, shard_size)
-    loaded_weight = _clone_loaded_weight(loaded_weight, param.device)
+    loaded_weight = _inherit_mmap_release(
+        loaded_weight,
+        loaded_weight.narrow(param.output_dim, start_idx, shard_size),
+    )
 
     padded_shape = list(loaded_weight.shape)
     padded_shape[param.output_dim] = param.tensor_shape[param.output_dim]
     _materialize_parameter_data(param, tuple(padded_shape), loaded_weight.dtype)
     param.data.zero_()
-    param.data.narrow(param.output_dim, 0, loaded_weight.shape[param.output_dim]).copy_(
-        loaded_weight
+    destination = param.data.narrow(
+        param.output_dim, 0, loaded_weight.shape[param.output_dim]
     )
+    streaming_copy_(destination, loaded_weight)
 
 
 def _gguf_embedding_weight_type_loader(
@@ -234,8 +247,9 @@ class _GGUFParamLoadMixin:
         if tp_size > 1 and loaded_weight.ndim >= 1:
             shard_size = loaded_weight.shape[0] // tp_size
             if shard_size > 0:
-                loaded_weight = loaded_weight.narrow(
-                    0, tp_rank * shard_size, shard_size
+                loaded_weight = _inherit_mmap_release(
+                    loaded_weight,
+                    loaded_weight.narrow(0, tp_rank * shard_size, shard_size),
                 )
         self._store(loaded_weight)
 
@@ -245,8 +259,9 @@ class _GGUFParamLoadMixin:
         if tp_size > 1 and loaded_weight.ndim >= 2:
             shard_size = loaded_weight.shape[1] // tp_size
             if shard_size > 0:
-                loaded_weight = loaded_weight.narrow(
-                    1, tp_rank * shard_size, shard_size
+                loaded_weight = _inherit_mmap_release(
+                    loaded_weight,
+                    loaded_weight.narrow(1, tp_rank * shard_size, shard_size),
                 )
         self._store(loaded_weight)
 
@@ -260,7 +275,10 @@ class _GGUFParamLoadMixin:
             and shard_size > 0
             and shard_size < loaded_weight.shape[0]
         ):
-            loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
+            loaded_weight = _inherit_mmap_release(
+                loaded_weight,
+                loaded_weight.narrow(0, tp_rank * shard_size, shard_size),
+            )
         self._store(loaded_weight, shard_id=shard_id)
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
@@ -277,8 +295,11 @@ class _GGUFParamLoadMixin:
             effective_tp_rank = (
                 tp_rank // num_kv_head_replicas if shard_id in ("k", "v") else tp_rank
             )
-            loaded_weight = loaded_weight.narrow(
-                0, effective_tp_rank * shard_size, shard_size
+            loaded_weight = _inherit_mmap_release(
+                loaded_weight,
+                loaded_weight.narrow(
+                    0, effective_tp_rank * shard_size, shard_size
+                ),
             )
         self._store(loaded_weight, shard_id=shard_id)
 

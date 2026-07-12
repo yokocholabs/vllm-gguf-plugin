@@ -103,7 +103,10 @@ def gguf_quant_weights_iterator(
     )
 
 
-def _mmap_tensor(array: np.ndarray) -> torch.Tensor:
+def _mmap_tensor(
+    array: np.ndarray,
+    release_callback=None,
+) -> torch.Tensor:
     """Create a read-only, zero-copy tensor view over GGUF mmap data."""
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -111,7 +114,61 @@ def _mmap_tensor(array: np.ndarray) -> torch.Tensor:
             message="The given NumPy array is not writable",
             category=UserWarning,
         )
-        return torch.from_numpy(array)
+        tensor = torch.from_numpy(array)
+    if release_callback is not None:
+        tensor._gguf_mmap_release = release_callback
+    return tensor
+
+
+_GGUF_STREAM_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _inherit_mmap_release(
+    source: torch.Tensor,
+    view: torch.Tensor,
+) -> torch.Tensor:
+    callback = getattr(source, "_gguf_mmap_release", None)
+    if callback is not None:
+        view._gguf_mmap_release = callback
+    return view
+
+
+def streaming_copy_(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    chunk_bytes: int = _GGUF_STREAM_CHUNK_BYTES,
+) -> torch.Tensor:
+    """Copy mmap-backed tensors through a bounded leading-dimension window."""
+    release = getattr(source, "_gguf_mmap_release", None)
+    if release is None or source.ndim == 0 or source.shape[0] == 0:
+        destination.copy_(source)
+        if release is not None:
+            release()
+        return destination
+
+    row_span_bytes = source.stride(0) * source.element_size()
+    rows_per_chunk = max(1, chunk_bytes // max(row_span_bytes, 1))
+    for start in range(0, source.shape[0], rows_per_chunk):
+        rows = min(rows_per_chunk, source.shape[0] - start)
+        destination.narrow(0, start, rows).copy_(
+            source.narrow(0, start, rows)
+        )
+        release()
+    return destination
+
+
+def streaming_to_device(
+    source: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    if source.ndim == 0:
+        source = source.reshape(1)
+    destination = torch.empty(
+        tuple(source.shape),
+        dtype=source.dtype,
+        device=device,
+    )
+    return streaming_copy_(destination, source)
 
 
 def _advise_gguf_mmap(reader: object, advice: int | None) -> None:
@@ -166,6 +223,9 @@ def gguf_quant_weights_iterator_multi(
     for gguf_file in gguf_files:
         reader = gguf.GGUFReader(gguf_file)
         _advise_gguf_mmap(reader, getattr(mmap, "MADV_SEQUENTIAL", None))
+        release_pages = lambda: _advise_gguf_mmap(
+            reader, getattr(mmap, "MADV_DONTNEED", None)
+        )
         try:
             for tensor in reader.tensors:
                 if gguf_to_hf_name_map is not None:
@@ -200,7 +260,7 @@ def gguf_quant_weights_iterator_multi(
                     from vllm_gguf_plugin.ops import ggml_dequantize
 
                     block_size, type_size = GGML_QUANT_SIZES[weight_type]
-                    raw = _mmap_tensor(tensor.data)
+                    raw = _mmap_tensor(tensor.data, release_pages)
                     if raw.dim() > 2:
                         leading = raw.shape[:-1]
                         packed_cols = raw.shape[-1]
@@ -231,6 +291,7 @@ def gguf_quant_weights_iterator_multi(
                         weight_type.name,
                         tuple(param.shape),
                     )
+                    release_pages()
                     yield name, param
                     del param
                     continue
@@ -246,10 +307,14 @@ def gguf_quant_weights_iterator_multi(
                     weight = weight.view(np.uint16)
                     if reader.byte_order == "S":
                         weight = weight.byteswap()
-                    param = _mmap_tensor(weight).view(torch.bfloat16)
+                    mapped = _mmap_tensor(weight, release_pages)
+                    param = _inherit_mmap_release(
+                        mapped, mapped.view(torch.bfloat16)
+                    )
                 else:
-                    param = _mmap_tensor(weight)
+                    param = _mmap_tensor(weight, release_pages)
                 yield name, param
+                release_pages()
                 del param
         finally:
             _advise_gguf_mmap(reader, getattr(mmap, "MADV_DONTNEED", None))
