@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import os
 from collections.abc import Iterable
 from typing import cast
@@ -198,28 +199,52 @@ class GGUFModelLoader(BaseModelLoader):
 
             adapter.restrict_to_model(model)
 
-            # Stream weights through model.load_weights, collecting only
-            # the small indexer tensors as a side effect.  Avoids
-            # materializing the full weight set into a list (OOM on 128GB).
-            indexer_weights: list[tuple[str, torch.Tensor]] = []
+            pending_indexer: dict[str, torch.Tensor] = {}
+            loaded_indexer_tensors = 0
+            peak_pending_indexers = 0
 
             def _filtered(
                 weights: Iterable[tuple[str, torch.Tensor]],
             ) -> Iterable[tuple[str, torch.Tensor]]:
+                nonlocal loaded_indexer_tensors, peak_pending_indexers
                 for name, tensor in weights:
-                    if ".indexer.wk_weights_proj" in name:
-                        indexer_weights.append((name, tensor))
-                    else:
+                    if ".indexer.wk_weights_proj" not in name:
                         yield name, tensor
+                        continue
+
+                    first = pending_indexer.pop(name, None)
+                    if first is None:
+                        pending_indexer[name] = tensor
+                        peak_pending_indexers = max(
+                            peak_pending_indexers, len(pending_indexer)
+                        )
+                        continue
+
+                    self._load_indexer_weights(
+                        model,
+                        [(name, first), (name, tensor)],
+                    )
+                    loaded_indexer_tensors += 2
 
             model.load_weights(_filtered(adapter.prepare_weights(model_config)))
 
-            if indexer_weights:
-                logger.info(
-                    "Loading %d indexer weight tensors directly "
-                    "(bypassing stacked_params_mapping)",
-                    len(indexer_weights),
-                )
-                self._load_indexer_weights(model, indexer_weights)
+            if pending_indexer:
+                remaining = list(pending_indexer.items())
+                self._load_indexer_weights(model, remaining)
+                loaded_indexer_tensors += len(remaining)
+                pending_indexer.clear()
+
+            logger.info(
+                "Stream-loaded %d indexer tensors with at most %d pending pairs",
+                loaded_indexer_tensors,
+                peak_pending_indexers,
+            )
             process_weights_after_loading(model, model_config, target_device)
+            del pending_indexer
+            gc.collect()
+            torch.accelerator.empty_cache()
+            logger.info(
+                "Released transient GGUF loader objects and allocator cache "
+                "before runtime warmup"
+            )
         return model

@@ -12,10 +12,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.parameter import BasevLLMParameter
 
 
-def _clone_loaded_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+def _clone_loaded_weight(
+    loaded_weight: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Copy a possibly mmap-backed TP view directly to its destination."""
     if len(loaded_weight.shape) == 0:
         loaded_weight = loaded_weight.reshape(1)
-    return loaded_weight.detach().clone()
+    return loaded_weight.detach().to(device=device, copy=True)
 
 
 def _resolve_gguf_weight_loader(
@@ -87,7 +90,7 @@ def _store_gguf_loaded_weight(
     loaded_weight: torch.Tensor,
     shard_id: int | str | None = None,
 ) -> None:
-    loaded_weight = _clone_loaded_weight(loaded_weight).to(device=param.device)
+    loaded_weight = _clone_loaded_weight(loaded_weight, param.device)
     if shard_id is None:
         _materialize_parameter_data(
             param, tuple(loaded_weight.shape), loaded_weight.dtype
@@ -141,10 +144,10 @@ def _gguf_embedding_weight_loader(
     param: Parameter | UninitializedParameter,
     loaded_weight: torch.Tensor,
 ) -> None:
-    loaded_weight = _clone_loaded_weight(loaded_weight).to(device=param.device)
     start_idx = layer.shard_indices.org_vocab_start_index
     shard_size = layer.shard_indices.org_vocab_end_index - start_idx
     loaded_weight = loaded_weight.narrow(param.output_dim, start_idx, shard_size)
+    loaded_weight = _clone_loaded_weight(loaded_weight, param.device)
 
     padded_shape = list(loaded_weight.shape)
     padded_shape[param.output_dim] = param.tensor_shape[param.output_dim]

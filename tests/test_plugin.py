@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
 import pytest
 import torch
 import vllm.engine.arg_utils as arg_utils_module
@@ -21,6 +22,7 @@ from vllm.transformers_utils.config import get_config_parser
 
 import vllm_gguf_plugin.config_parser as gguf_config_parser_module
 import vllm_gguf_plugin.quantization as gguf_quantization
+import vllm_gguf_plugin.weight_utils as weight_utils_module
 import vllm_gguf_plugin.weights_adapter.default as default_adapter_module
 from vllm_gguf_plugin import OOTGGUFConfig, OOTGGUFModelLoader, register
 from vllm_gguf_plugin.config_parser import GGUFConfigParser
@@ -401,6 +403,46 @@ def test_gguf_filter_limits_mtp_draft_to_materialized_layer():
         "blk.78.weight": "model.layers.78.mtp_block.probe.weight",
         "token_embd.weight": "model.embed_tokens.weight",
     }
+
+
+def test_gguf_iterator_streams_from_mmap_and_releases_shard_cache(monkeypatch):
+    data = np.arange(16, dtype=np.uint8)
+
+    class FakeWeightType:
+        name = "F32"
+
+    class FakeTensor:
+        name = "blk.0.weight"
+        tensor_type = FakeWeightType()
+
+        def __init__(self):
+            self.data = data
+
+    class FakeReader:
+        byte_order = "L"
+
+        def __init__(self, _path):
+            self.tensors = [FakeTensor()]
+
+    released = []
+    monkeypatch.setattr(weight_utils_module.gguf, "GGUFReader", FakeReader)
+    monkeypatch.setattr(
+        weight_utils_module,
+        "_drop_gguf_file_cache",
+        released.append,
+    )
+
+    weights = list(
+        weight_utils_module.gguf_quant_weights_iterator_multi(
+            ["model-00001.gguf"],
+            {"blk.0.weight": "model.layers.0.weight"},
+        )
+    )
+
+    assert len(weights) == 1
+    _, loaded = weights[0]
+    assert loaded.data_ptr() == data.__array_interface__["data"][0]
+    assert released == ["model-00001.gguf"]
 
 
 def test_indexer_loader_resolves_mtp_block():

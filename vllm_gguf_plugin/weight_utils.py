@@ -2,7 +2,9 @@
 
 import glob
 import itertools
+import mmap
 import os
+import warnings
 from collections.abc import Generator
 from pathlib import Path
 
@@ -101,109 +103,158 @@ def gguf_quant_weights_iterator(
     )
 
 
+def _mmap_tensor(array: np.ndarray) -> torch.Tensor:
+    """Create a read-only, zero-copy tensor view over GGUF mmap data."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The given NumPy array is not writable",
+            category=UserWarning,
+        )
+        return torch.from_numpy(array)
+
+
+def _advise_gguf_mmap(reader: object, advice: int | None) -> None:
+    """Apply mmap advice to the GGUF reader when its mapping is exposed."""
+    if advice is None:
+        return
+    data = getattr(reader, "data", None)
+    mapping = getattr(data, "_mmap", None)
+    madvise = getattr(mapping, "madvise", None)
+    if madvise is None:
+        return
+    try:
+        madvise(advice)
+    except (OSError, ValueError):
+        logger.debug("Could not apply mmap advice to GGUF shard", exc_info=True)
+
+
+def _drop_gguf_file_cache(path: str) -> None:
+    """Release completed GGUF shard pages from the Linux filesystem cache."""
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        logger.info("Released GGUF shard file cache: %s", os.path.basename(path))
+    except OSError:
+        logger.debug("Could not release GGUF shard file cache: %s", path, exc_info=True)
+
+
 def gguf_quant_weights_iterator_multi(
     gguf_files: list[str],
     gguf_to_hf_name_map: dict[str, str] | None = None,
     unquantized_modules: list[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Yield ``(name, tensor)`` for all tensors in *gguf_files*.
+    """Yield tensors from mmap without materializing full host-side copies.
 
-    When *gguf_to_hf_name_map* is ``None``, raw GGUF tensor names are used
-    directly (useful when a caller will apply a :class:`WeightsMapper``
-    afterwards).  When a mapping is provided, tensors not present in the map
-    are skipped and names are translated accordingly.
-
-    When *unquantized_modules* is provided, quantized tensors whose mapped
-    name contains one of the listed module prefixes are dequantized on the
-    fly via ``ggml_dequantize`` and yielded as ``.weight`` instead of
-    ``.qweight`` / ``.qweight_type``.
+    The consumer may narrow a tensor for TP before its single device copy.
+    Completed shard pages are evicted from the filesystem cache so sequential
+    GGUF reads cannot displace anonymous runtime memory into swap.
     """
     _QUANT_TYPES = ("F32", "BF16", "F16")
 
     logger.debug(
         "gguf_quant_weights_iterator_multi: files=%s unquantized_modules=%s",
-        [os.path.basename(f) for f in gguf_files], unquantized_modules,
+        [os.path.basename(f) for f in gguf_files],
+        unquantized_modules,
     )
 
     for gguf_file in gguf_files:
         reader = gguf.GGUFReader(gguf_file)
-        for tensor in reader.tensors:
-            if gguf_to_hf_name_map is not None:
-                if tensor.name not in gguf_to_hf_name_map:
-                    continue
-                name = gguf_to_hf_name_map[tensor.name]
-            else:
-                name = tensor.name
-
-            weight_type = tensor.tensor_type
-
-            # Dequantize tensors belonging to modules marked as unquantized
-            # but stored quantized in the GGUF (e.g. GLM-5.2 indexer
-            # wk/weights_proj with Q8_0).  Yield as .weight, not .qweight.
-            is_unquant_module = (
-                weight_type.name not in _QUANT_TYPES
-                and unquantized_modules
-                and any(
-                    mod in name.removesuffix(".weight")
-                    for mod in unquantized_modules
-                )
-            )
-            if "indexer" in name:
-                logger.debug(
-                    "GGUF indexer tensor: gguf=%s hf_name=%s type=%s "
-                    "is_unquant_module=%s unquantized_modules=%s",
-                    tensor.name, name, weight_type.name,
-                    is_unquant_module, unquantized_modules,
-                )
-            if is_unquant_module:
-                from gguf import GGML_QUANT_SIZES
-
-                from vllm_gguf_plugin.ops import ggml_dequantize
-
-                block_size, type_size = GGML_QUANT_SIZES[weight_type]
-                raw = torch.tensor(tensor.data)
-                # For 3D per-head tensors (e.g. GLM-5.2 attn_k_b
-                # [n_head, kv_lora, qk_nope_packed]), dequant each
-                # row independently by reshaping to 2D, dequanting,
-                # then reshaping back to 3D.  This preserves the
-                # per-head structure for prepare_weights to transpose.
-                if raw.dim() > 2:
-                    leading = raw.shape[:-1]
-                    packed_cols = raw.shape[-1]
-                    raw_2d = raw.reshape(-1, packed_cols)
-                    rows = raw_2d.shape[0]
-                    cols = packed_cols // type_size * block_size
-                    dequant_2d = ggml_dequantize(
-                        raw_2d.cuda(), weight_type, rows, cols,
-                        torch.bfloat16,
-                    ).cpu()
-                    param = dequant_2d.reshape(*leading, cols)
+        _advise_gguf_mmap(reader, getattr(mmap, "MADV_SEQUENTIAL", None))
+        try:
+            for tensor in reader.tensors:
+                if gguf_to_hf_name_map is not None:
+                    if tensor.name not in gguf_to_hf_name_map:
+                        continue
+                    name = gguf_to_hf_name_map[tensor.name]
                 else:
-                    rows = raw.shape[0] if raw.dim() > 1 else 1
-                    cols = raw.shape[-1] // type_size * block_size
-                    param = ggml_dequantize(
-                        raw.cuda(), weight_type, rows, cols, torch.bfloat16
-                    ).cpu()
-                logger.debug(
-                    "Dequantized %s: %s -> bf16 %s",
-                    name, weight_type.name, tuple(param.shape),
+                    name = tensor.name
+
+                weight_type = tensor.tensor_type
+                is_unquant_module = (
+                    weight_type.name not in _QUANT_TYPES
+                    and unquantized_modules
+                    and any(
+                        mod in name.removesuffix(".weight")
+                        for mod in unquantized_modules
+                    )
                 )
+                if "indexer" in name:
+                    logger.debug(
+                        "GGUF indexer tensor: gguf=%s hf_name=%s type=%s "
+                        "is_unquant_module=%s unquantized_modules=%s",
+                        tensor.name,
+                        name,
+                        weight_type.name,
+                        is_unquant_module,
+                        unquantized_modules,
+                    )
+                if is_unquant_module:
+                    from gguf import GGML_QUANT_SIZES
+
+                    from vllm_gguf_plugin.ops import ggml_dequantize
+
+                    block_size, type_size = GGML_QUANT_SIZES[weight_type]
+                    raw = _mmap_tensor(tensor.data)
+                    if raw.dim() > 2:
+                        leading = raw.shape[:-1]
+                        packed_cols = raw.shape[-1]
+                        raw_2d = raw.reshape(-1, packed_cols)
+                        rows = raw_2d.shape[0]
+                        cols = packed_cols // type_size * block_size
+                        dequant_2d = ggml_dequantize(
+                            raw_2d.cuda(),
+                            weight_type,
+                            rows,
+                            cols,
+                            torch.bfloat16,
+                        ).cpu()
+                        param = dequant_2d.reshape(*leading, cols)
+                    else:
+                        rows = raw.shape[0] if raw.dim() > 1 else 1
+                        cols = raw.shape[-1] // type_size * block_size
+                        param = ggml_dequantize(
+                            raw.cuda(),
+                            weight_type,
+                            rows,
+                            cols,
+                            torch.bfloat16,
+                        ).cpu()
+                    logger.debug(
+                        "Dequantized %s: %s -> bf16 %s",
+                        name,
+                        weight_type.name,
+                        tuple(param.shape),
+                    )
+                    yield name, param
+                    del param
+                    continue
+
+                if weight_type.name not in _QUANT_TYPES:
+                    yield name.replace("weight", "qweight_type"), torch.tensor(
+                        weight_type
+                    )
+                    name = name.replace("weight", "qweight")
+
+                weight = tensor.data
+                if weight_type.name == "BF16" and weight.dtype == np.uint8:
+                    weight = weight.view(np.uint16)
+                    if reader.byte_order == "S":
+                        weight = weight.byteswap()
+                    param = _mmap_tensor(weight).view(torch.bfloat16)
+                else:
+                    param = _mmap_tensor(weight)
                 yield name, param
-                continue
-
-            if weight_type.name not in _QUANT_TYPES:
-                yield name.replace("weight", "qweight_type"), torch.tensor(weight_type)
-                name = name.replace("weight", "qweight")
-
-            weight = tensor.data
-            if weight_type.name == "BF16" and weight.dtype == np.uint8:
-                weight = weight.view(np.uint16)
-                if reader.byte_order == "S":
-                    weight = weight.byteswap()
-                param = torch.tensor(weight).view(torch.bfloat16)
-            else:
-                param = torch.tensor(weight)
-            yield name, param
+                del param
+        finally:
+            _advise_gguf_mmap(reader, getattr(mmap, "MADV_DONTNEED", None))
+            del reader
+            _drop_gguf_file_cache(gguf_file)
 
 
 def get_gguf_unquantized_params(gguf_files: list[str]) -> list[str]:
