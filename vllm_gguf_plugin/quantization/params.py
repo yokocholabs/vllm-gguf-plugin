@@ -123,8 +123,8 @@ def _store_gguf_weight_type(
     loaded_weight: torch.Tensor,
     shard_id: int | str | None = None,
 ) -> None:
-    loaded_weight = _clone_loaded_weight(loaded_weight).to(
-        device=param.device, dtype=torch.uint8
+    loaded_weight = _clone_loaded_weight(loaded_weight, param.device).to(
+        dtype=torch.uint8
     )
     weight_type = int(loaded_weight.item())
     num_elements = getattr(param, "num_elements", 1)
