@@ -32,6 +32,42 @@ progress_logger = init_logger("vllm.gguf_plugin.progress")
 _LAYER_NAME_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
+def _indexer_parameter_candidates(name: str) -> tuple[str, ...]:
+    """Return model parameter paths supported for a mapped indexer weight."""
+    candidates = [name]
+    if name.startswith("model."):
+        candidates.append(name[len("model.") :])
+    else:
+        candidates.append("model." + name)
+
+    for candidate in tuple(candidates):
+        if ".self_attn." not in candidate:
+            continue
+        candidates.append(
+            candidate.replace(
+                ".self_attn.",
+                ".self_attn.mla_attn.",
+                1,
+            )
+        )
+        candidates.append(
+            candidate.replace(
+                ".self_attn.",
+                ".mtp_block.self_attn.",
+                1,
+            )
+        )
+        candidates.append(
+            candidate.replace(
+                ".self_attn.",
+                ".mtp_block.self_attn.mla_attn.",
+                1,
+            )
+        )
+
+    return tuple(dict.fromkeys(candidates))
+
+
 class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
     """Default adapter for GGUF models."""
 
@@ -455,22 +491,25 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         return self.load_spec
 
     def restrict_to_model(self, model: torch.nn.Module) -> None:
-        """Restrict GGUF mappings to layers materialized by *model*.
+        """Restrict GGUF mappings to parameters materialized by *model*.
 
-        This applies to pipeline stages and reduced draft models such as MTP.
-        Filtering before the iterator touches tensor data prevents a draft
-        containing only one layer from paging the full GGUF checkpoint.
+        This applies to pipeline stages, reduced draft models such as MTP,
+        and GLM layers that share a previous layer's sparse index. Filtering
+        before the iterator touches tensor data prevents unused tensors from
+        being paged in and dequantized.
         """
         if self.load_spec is None:
             return
 
+        parameter_names = {name for name, _ in model.named_parameters()}
         materialized_layers = {
             int(match.group(1))
-            for name, _ in model.named_parameters()
+            for name in parameter_names
             if (match := _LAYER_NAME_RE.search(name)) is not None
         }
         original = self.load_spec.gguf_to_hf_name_map
         filtered: dict[str, str] = {}
+        excluded_indexer_tensors = 0
         for gguf_name, hf_name in original.items():
             layer_match = _LAYER_NAME_RE.search(hf_name)
             if (
@@ -481,14 +520,25 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 continue
             if is_pp_missing_parameter(hf_name, model):
                 continue
+            if (
+                ".indexer.wk_weights_proj.weight" in hf_name
+                and not any(
+                    candidate in parameter_names
+                    for candidate in _indexer_parameter_candidates(hf_name)
+                )
+            ):
+                excluded_indexer_tensors += 1
+                continue
             filtered[gguf_name] = hf_name
 
         self.load_spec.gguf_to_hf_name_map = filtered
         logger.info(
-            "Model-local GGUF map: retained %d/%d tensors across %d layers",
+            "Model-local GGUF map: retained %d/%d tensors across %d layers; "
+            "excluded %d unmaterialized indexer tensors",
             len(filtered),
             len(original),
             len(materialized_layers),
+            excluded_indexer_tensors,
         )
 
     def prepare_weights(

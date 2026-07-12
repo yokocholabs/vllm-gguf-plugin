@@ -21,6 +21,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from .quantization import GGUFConfig
 from .weight_utils import download_gguf, resolve_local_gguf
 from .weights_adapter import get_weights_adapter
+from .weights_adapter.default import _indexer_parameter_candidates
 
 logger = init_logger(__name__)
 
@@ -116,56 +117,16 @@ class GGUFModelLoader(BaseModelLoader):
 
         params_dict = dict(model.named_parameters())
         for name, tensors in by_name.items():
-            candidates = [name]
-            if name.startswith("model."):
-                candidates.append(name[len("model.") :])
-            else:
-                candidates.append("model." + name)
-            for candidate in tuple(candidates):
-                if ".self_attn." in candidate:
-                    candidates.append(
-                        candidate.replace(
-                            ".self_attn.",
-                            ".self_attn.mla_attn.",
-                            1,
-                        )
-                    )
-                    candidates.append(
-                        candidate.replace(
-                            ".self_attn.",
-                            ".mtp_block.self_attn.",
-                            1,
-                        )
-                    )
-                    candidates.append(
-                        candidate.replace(
-                            ".self_attn.",
-                            ".mtp_block.self_attn.mla_attn.",
-                            1,
-                        )
-                    )
-
+            candidates = _indexer_parameter_candidates(name)
             param_name = next(
                 (candidate for candidate in candidates if candidate in params_dict),
                 None,
             )
             if param_name is None:
-                mtp_prefixes = tuple(
-                    candidate.split(".self_attn.", 1)[0] + ".mtp_block."
-                    for candidate in candidates[:2]
-                    if ".self_attn." in candidate
+                raise ValueError(
+                    f"Required indexer weight {name} not found in model params; "
+                    f"candidates={candidates}"
                 )
-                if mtp_prefixes and any(
-                    parameter.startswith(mtp_prefixes) for parameter in params_dict
-                ):
-                    raise ValueError(
-                        f"Required MTP indexer weight {name} not found in model params"
-                    )
-                logger.warning(
-                    "Indexer weight %s not found in model params, skipping",
-                    name,
-                )
-                continue
 
             param = params_dict[param_name]
             expected_shape = list(param.data.shape)

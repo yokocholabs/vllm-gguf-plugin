@@ -382,6 +382,24 @@ def _mtp_indexer_model() -> torch.nn.Module:
     return model
 
 
+def _shared_indexer_model() -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleDict(
+        {"0": torch.nn.Module(), "1": torch.nn.Module()}
+    )
+    for layer in model.model.layers.values():
+        layer.probe = torch.nn.Linear(1, 1, bias=False)
+        layer.self_attn = torch.nn.Module()
+    layer_zero = model.model.layers["0"]
+    layer_zero.self_attn.indexer = torch.nn.Module()
+    layer_zero.self_attn.indexer.wk_weights_proj = torch.nn.Linear(
+        4, 3, bias=False
+    )
+    model.model.layers["1"].self_attn.indexer = None
+    return model
+
+
 def test_gguf_filter_limits_mtp_draft_to_materialized_layer():
     adapter = default_adapter_module.GGUFWeightsAdapter.__new__(
         default_adapter_module.GGUFWeightsAdapter
@@ -402,6 +420,36 @@ def test_gguf_filter_limits_mtp_draft_to_materialized_layer():
     assert adapter.load_spec.gguf_to_hf_name_map == {
         "blk.78.weight": "model.layers.78.mtp_block.probe.weight",
         "token_embd.weight": "model.embed_tokens.weight",
+    }
+
+
+def test_gguf_filter_excludes_shared_unmaterialized_indexers():
+    adapter = default_adapter_module.GGUFWeightsAdapter.__new__(
+        default_adapter_module.GGUFWeightsAdapter
+    )
+    adapter.load_spec = default_adapter_module.GGUFLoadSpec(
+        weights_source=[],
+        unquantized_modules=[],
+        gguf_to_hf_name_map={
+            "blk.0.probe": "model.layers.0.probe.weight",
+            "blk.0.indexer": (
+                "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
+            ),
+            "blk.1.probe": "model.layers.1.probe.weight",
+            "blk.1.indexer": (
+                "model.layers.1.self_attn.indexer.wk_weights_proj.weight"
+            ),
+        },
+    )
+
+    adapter.restrict_to_model(_shared_indexer_model())
+
+    assert adapter.load_spec.gguf_to_hf_name_map == {
+        "blk.0.probe": "model.layers.0.probe.weight",
+        "blk.0.indexer": (
+            "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
+        ),
+        "blk.1.probe": "model.layers.1.probe.weight",
     }
 
 
@@ -545,7 +593,7 @@ def test_indexer_loader_rejects_missing_mtp_parameter():
     del model.model.layers["78"].mtp_block.self_attn.indexer.wk_weights_proj
     mapped_name = "model.layers.78.self_attn.indexer.wk_weights_proj.weight"
 
-    with pytest.raises(ValueError, match="Required MTP indexer weight"):
+    with pytest.raises(ValueError, match="Required indexer weight"):
         GGUFModelLoader._load_indexer_weights(
             model,
             [(mapped_name, torch.ones((3, 4)))],
